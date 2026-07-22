@@ -289,6 +289,265 @@ pub struct ConfigManager {
     pub protocol_tasks: RefCell<HashMap<String, Task<()>>>,
 }
 
+static NEXT_COMMIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_commit_generation() -> u64 {
+    NEXT_COMMIT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn dispatch_policy_commit_end(
+    clients: &HashMap<String, UnboundedSender<ConfigRequest>>,
+    timeout: std::time::Duration,
+    generation: u64,
+) -> anyhow::Result<()> {
+    let Some(policy_tx) = clients.get("policy") else {
+        return Ok(());
+    };
+    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(0);
+    let mut req = ConfigRequest::new(Vec::new(), ConfigOp::CommitEnd);
+    req.commit_ack = Some(ack_tx);
+    req.commit_generation = generation;
+    policy_tx
+        .send(req)
+        .map_err(|_| anyhow::anyhow!("policy config actor stopped during commit"))?;
+    let wait = || ack_rx.recv_timeout(timeout);
+    let ack = match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            // commit_config is synchronous, but the policy actor runs on
+            // this runtime.  Mark the wait as blocking so Tokio can lend
+            // the worker slot to the actor that must produce the ack.
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
+    };
+    ack.map_err(|_| anyhow::anyhow!("policy config commit barrier timed out"))?;
+    Ok(())
+}
+
+fn dispatch_commit_end_after_policy(
+    clients: &HashMap<String, UnboundedSender<ConfigRequest>>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let generation = next_commit_generation();
+    dispatch_policy_commit_end(clients, timeout, generation)?;
+    for (proto, tx) in clients {
+        if proto == "policy" {
+            continue;
+        }
+        let mut req = ConfigRequest::new(Vec::new(), ConfigOp::CommitEnd);
+        req.commit_generation = generation;
+        tx.send(req)
+            .map_err(|_| anyhow::anyhow!("{proto} config actor stopped during commit"))?;
+    }
+    Ok(())
+}
+
+/// Undo callback-side staging after the policy barrier rejects a commit.
+///
+/// Config callbacks intentionally mutate actor-owned candidate state before
+/// `CommitEnd`.  Therefore returning early at the policy barrier is not enough:
+/// an identical retry can otherwise become a callback no-op while the live
+/// task still has the old value.  Replay the exact inverse diff in reverse
+/// order, commit that inverse in policy (which may already have processed the
+/// failed `CommitEnd`), then delimit a fresh transaction in every dependent.
+fn rollback_dispatched_config(
+    clients: &HashMap<String, UnboundedSender<ConfigRequest>>,
+    dispatched: &[(Vec<CommandPath>, ConfigOp)],
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    // A dependent may already have consumed the failed commit's CommitEnd
+    // before a later dependent's closed channel made dispatch fail.  That
+    // clears its original baseline (and may already have respawned runtime
+    // state), so delimit the inverse transaction *before* replaying callbacks.
+    // Dependents which never received CommitEnd are safe too: this replaces
+    // their failed-candidate baseline with the same failed candidate, allowing
+    // the inverse callbacks below to be observed as a structural change.
+    for (proto, tx) in clients {
+        if proto != "policy" {
+            let _ = tx.send(ConfigRequest::new(Vec::new(), ConfigOp::CommitStart));
+        }
+    }
+
+    for (paths, op) in dispatched.iter().rev() {
+        let inverse = match op {
+            ConfigOp::Set => ConfigOp::Delete,
+            ConfigOp::Delete => ConfigOp::Set,
+            _ => continue,
+        };
+        for tx in clients.values() {
+            // A stopped actor is reported by the policy rollback barrier below
+            // (or will be respawned by its supervisor).  Continue so every
+            // still-live dependent gets its staging restored.
+            let _ = tx.send(ConfigRequest::new(paths.clone(), inverse));
+        }
+    }
+
+    let rollback_generation = next_commit_generation();
+    let policy_result = dispatch_policy_commit_end(clients, timeout, rollback_generation);
+
+    // Close the inverse transaction only after policy has published the
+    // matching restored inventory.  This is a no-op for runtime state (the
+    // final candidate equals running), but it drains generation-tagged policy
+    // batches in per-VRF BGP and prevents repeated failed commits from leaving
+    // orphaned buffers behind.
+    if policy_result.is_ok() {
+        for (proto, tx) in clients {
+            if proto != "policy" {
+                let mut req = ConfigRequest::new(Vec::new(), ConfigOp::CommitEnd);
+                req.commit_generation = rollback_generation;
+                let _ = tx.send(req);
+            }
+        }
+    }
+
+    // Capture the restored baseline as a clean idle state.  The next real
+    // retry sends another CommitStart and remains idempotent.
+    for (proto, tx) in clients {
+        if proto != "policy" {
+            let _ = tx.send(ConfigRequest::new(Vec::new(), ConfigOp::CommitStart));
+        }
+    }
+    policy_result
+}
+
+#[cfg(test)]
+mod policy_commit_barrier_tests {
+    use super::*;
+
+    #[test]
+    fn policy_ack_precedes_dependent_commit_end() {
+        let (policy_tx, mut policy_rx) = mpsc::unbounded_channel::<ConfigRequest>();
+        let (bgp_tx, mut bgp_rx) = mpsc::unbounded_channel::<ConfigRequest>();
+        let clients = HashMap::from([
+            ("policy".to_string(), policy_tx),
+            ("bgp".to_string(), bgp_tx),
+        ]);
+        let policy = std::thread::spawn(move || {
+            let req = policy_rx.blocking_recv().expect("policy CommitEnd");
+            assert_eq!(req.op, ConfigOp::CommitEnd);
+            let generation = req.commit_generation;
+            req.commit_ack.expect("barrier ack").send(()).unwrap();
+            generation
+        });
+
+        dispatch_commit_end_after_policy(&clients, std::time::Duration::from_secs(1)).unwrap();
+        let policy_generation = policy.join().unwrap();
+        let bgp_req = bgp_rx.blocking_recv().expect("dependent CommitEnd");
+        assert_eq!(bgp_req.op, ConfigOp::CommitEnd);
+        assert_ne!(policy_generation, 0);
+        assert_eq!(bgp_req.commit_generation, policy_generation);
+    }
+
+    #[test]
+    fn stopped_or_stalled_policy_actor_fails_without_dispatching_dependents() {
+        let (stopped_tx, stopped_rx) = mpsc::unbounded_channel::<ConfigRequest>();
+        drop(stopped_rx);
+        let (bgp_tx, mut bgp_rx) = mpsc::unbounded_channel::<ConfigRequest>();
+        let clients = HashMap::from([
+            ("policy".to_string(), stopped_tx),
+            ("bgp".to_string(), bgp_tx.clone()),
+        ]);
+        assert!(
+            dispatch_commit_end_after_policy(&clients, std::time::Duration::from_millis(20))
+                .is_err()
+        );
+        assert!(bgp_rx.try_recv().is_err());
+
+        let (stalled_tx, _stalled_rx) = mpsc::unbounded_channel::<ConfigRequest>();
+        let clients = HashMap::from([
+            ("policy".to_string(), stalled_tx),
+            ("bgp".to_string(), bgp_tx),
+        ]);
+        assert!(
+            dispatch_commit_end_after_policy(&clients, std::time::Duration::from_millis(20))
+                .is_err()
+        );
+        assert!(bgp_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_policy_barrier_rolls_back_dependent_staging_before_retry() {
+        let (policy_tx, mut policy_rx) = mpsc::unbounded_channel::<ConfigRequest>();
+        let (bgp_tx, mut bgp_rx) = mpsc::unbounded_channel::<ConfigRequest>();
+        let clients = HashMap::from([
+            ("policy".to_string(), policy_tx),
+            ("bgp".to_string(), bgp_tx),
+        ]);
+
+        let policy = std::thread::spawn(move || {
+            // Simulate an actor which completed the candidate policy commit,
+            // but whose acknowledgement was lost.  Dropping the sender makes
+            // the manager's barrier fail deterministically.
+            let failed = policy_rx.blocking_recv().expect("failed CommitEnd");
+            assert_eq!(failed.op, ConfigOp::CommitEnd);
+            drop(failed.commit_ack);
+
+            // Policy has its own completed transaction boundary, so rollback
+            // is FIFO behind it: inverse callback, then a second CommitEnd.
+            assert_eq!(
+                policy_rx.blocking_recv().expect("inverse callback").op,
+                ConfigOp::Delete
+            );
+            let rollback = policy_rx.blocking_recv().expect("rollback CommitEnd");
+            assert_eq!(rollback.op, ConfigOp::CommitEnd);
+            rollback.commit_ack.expect("rollback ack").send(()).unwrap();
+        });
+
+        assert!(
+            dispatch_commit_end_after_policy(&clients, std::time::Duration::from_secs(1)).is_err()
+        );
+        rollback_dispatched_config(
+            &clients,
+            &[(Vec::new(), ConfigOp::Set)],
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        policy.join().unwrap();
+
+        assert_eq!(
+            bgp_rx
+                .blocking_recv()
+                .expect("inverse transaction start")
+                .op,
+            ConfigOp::CommitStart
+        );
+        assert_eq!(
+            bgp_rx.blocking_recv().expect("inverse callback").op,
+            ConfigOp::Delete
+        );
+        let rollback = bgp_rx.blocking_recv().expect("rollback CommitEnd");
+        assert_eq!(rollback.op, ConfigOp::CommitEnd);
+        assert_ne!(rollback.commit_generation, 0);
+        assert_eq!(
+            bgp_rx.blocking_recv().expect("transaction reset").op,
+            ConfigOp::CommitStart
+        );
+        assert!(bgp_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_yields_runtime_worker_to_policy_actor() {
+        let (policy_tx, mut policy_rx) = mpsc::unbounded_channel::<ConfigRequest>();
+        let (bgp_tx, mut bgp_rx) = mpsc::unbounded_channel::<ConfigRequest>();
+        let clients = HashMap::from([
+            ("policy".to_string(), policy_tx),
+            ("bgp".to_string(), bgp_tx),
+        ]);
+        let actor = tokio::spawn(async move {
+            let req = policy_rx.recv().await.expect("policy CommitEnd");
+            tokio::task::yield_now().await;
+            req.commit_ack.expect("barrier ack").send(()).unwrap();
+        });
+
+        dispatch_commit_end_after_policy(&clients, std::time::Duration::from_secs(1)).unwrap();
+        actor.await.unwrap();
+        assert_eq!(
+            bgp_rx.try_recv().expect("dependent CommitEnd").op,
+            ConfigOp::CommitEnd
+        );
+    }
+}
+
 impl ConfigManager {
     pub fn new(
         yang_path: String,
@@ -568,6 +827,7 @@ impl ConfigManager {
         // commit will set `router bgp` we must spawn BGP before IS-IS even
         // if `router isis` appears first in the diff.
         let mut will_set_bgp = false;
+        let mut dispatched = Vec::new();
         for line in diff.lines() {
             let Some(first_char) = line.chars().next() else {
                 continue;
@@ -730,11 +990,35 @@ impl ConfigManager {
                 for tx in self.cm_clients.borrow().values() {
                     tx.send(ConfigRequest::new(paths.clone(), op)).unwrap();
                 }
+                dispatched.push((paths, op));
             }
         }
-        for tx in self.cm_clients.borrow().values() {
-            tx.send(ConfigRequest::new(Vec::new(), ConfigOp::CommitEnd))
-                .unwrap();
+        // Policy definitions are dependencies of protocol bindings.  Finish
+        // the policy CommitEnd first so its canonical inventory notification
+        // is already queued before BGP (or another consumer) sees CommitEnd.
+        // This closes the cross-actor race for a prefix-set created and bound
+        // in the same candidate commit.  The production runtime is Tokio's
+        // multi-thread flavor; the helper uses block_in_place while awaiting
+        // the policy ack so the actor can run even if this call occupies a
+        // worker.  A stopped/stalled policy actor aborts the commit before
+        // any dependent CommitEnd is dispatched, preferring a visible error
+        // over protocols applying a policy-inconsistent partial commit.
+        let clients = self.cm_clients.borrow().clone();
+        if let Err(commit_error) =
+            dispatch_commit_end_after_policy(&clients, std::time::Duration::from_secs(5))
+        {
+            let rollback_error = rollback_dispatched_config(
+                &clients,
+                &dispatched,
+                std::time::Duration::from_secs(5),
+            )
+            .err();
+            return match rollback_error {
+                Some(rollback_error) => Err(anyhow::anyhow!(
+                    "{commit_error}; config actor rollback failed: {rollback_error}"
+                )),
+                None => Err(commit_error),
+            };
         }
 
         // Tear down protocol tasks whose `router <proto>` config has
@@ -1021,6 +1305,8 @@ impl ConfigManager {
                 }],
                 op: ConfigOp::Completion,
                 resp: Some(comp_tx),
+                commit_ack: None,
+                commit_generation: 0,
             };
             let _ = tx.send(req);
             comp_rx.await.unwrap_or_default()
@@ -2400,6 +2686,241 @@ mod yang_load_tests {
                 code,
                 ExecCode::Success,
                 "should parse as a settable path: {cmd}"
+            );
+        }
+    }
+
+    /// The per-VRF CE-neighbor prefix-set binding is schema-driven, so the
+    /// same leaves must survive every accepted config representation. This
+    /// also pins delete grammar, running-config serialization, and duplicate
+    /// set idempotence in one place.
+    #[test]
+    fn bgp_vrf_neighbor_prefix_set_all_formats_round_trip() {
+        use crate::config::configs::set;
+        use crate::config::files::load_config_file;
+        use crate::config::json::json_read;
+        use crate::config::parse::{State, parse};
+        use crate::config::paths::path_try_trim;
+        use crate::config::yaml::yaml_read;
+        use crate::config::{Config, ExecCode};
+        use libyang::to_entry;
+        use std::rc::Rc;
+
+        let mut yang = YangStore::new();
+        yang.add_path(concat!(env!("CARGO_MANIFEST_DIR"), "/yang"));
+        yang.read_with_resolve("configure")
+            .unwrap_or_else(|e| panic!("configure failed to load: {e:#}"));
+        yang.identity_resolve();
+        let module = yang.find_module("configure").unwrap();
+        let configure = to_entry(&yang, module);
+        let child = |name: &str| {
+            configure
+                .dir
+                .borrow()
+                .iter()
+                .find(|entry| entry.name == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("configure mode has no `{name}` entry"))
+        };
+        let set_entry = child("set");
+
+        let expected_in =
+            "set router bgp vrf vrf-blue neighbor 192.0.2.2 afi-safi ipv4 prefix-set in PEER-IN-V4";
+        let expected_out = "set router bgp vrf vrf-blue neighbor 192.0.2.2 afi-safi ipv4 prefix-set out PEER-OUT-V4";
+        let expected_in_v6 =
+            "set router bgp vrf vrf-blue neighbor 192.0.2.2 afi-safi ipv6 prefix-set in PEER-IN-V6";
+        let expected_out_v6 = "set router bgp vrf vrf-blue neighbor 192.0.2.2 afi-safi ipv6 prefix-set out PEER-OUT-V6";
+
+        // Direct set grammar. Delete is checked below against a populated
+        // running config because delete completion/matching is intentionally
+        // constrained to values that currently exist.
+        for command in [
+            expected_in.to_string(),
+            expected_out.to_string(),
+            expected_in_v6.to_string(),
+            expected_out_v6.to_string(),
+        ] {
+            let (code, _, _) = parse(&command, configure.clone(), None, State::new());
+            assert_eq!(code, ExecCode::Success, "must parse: {command}");
+        }
+
+        let yaml = r#"
+router:
+  bgp:
+    vrf:
+    - name: vrf-blue
+      neighbor:
+      - remote-address: 192.0.2.2
+        afi-safi:
+        - name: ipv4
+          prefix-set:
+            in: PEER-IN-V4
+            out: PEER-OUT-V4
+        - name: ipv6
+          prefix-set:
+            in: PEER-IN-V6
+            out: PEER-OUT-V6
+"#;
+        let json = r#"{
+  "router": {"bgp": {"vrf": [{
+    "name": "vrf-blue",
+    "neighbor": [{
+      "remote-address": "192.0.2.2",
+      "afi-safi": [{
+        "name": "ipv4",
+        "prefix-set": {"in": "PEER-IN-V4", "out": "PEER-OUT-V4"}
+      }, {
+        "name": "ipv6",
+        "prefix-set": {"in": "PEER-IN-V6", "out": "PEER-OUT-V6"}
+      }]
+    }]
+  }]}}
+}"#;
+        let cli = r#"
+router {
+  bgp {
+    vrf vrf-blue {
+      neighbor 192.0.2.2 {
+        afi-safi ipv4 {
+          prefix-set {
+            in PEER-IN-V4;
+            out PEER-OUT-V4;
+          }
+        }
+        afi-safi ipv6 {
+          prefix-set {
+            in PEER-IN-V6;
+            out PEER-OUT-V6;
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+        let (yaml_commands, yaml_errors) = yaml_read(set_entry.clone(), yaml);
+        assert!(yaml_errors.is_empty(), "YAML errors: {yaml_errors:?}");
+        let (json_commands, json_errors) = json_read(set_entry.clone(), json);
+        assert!(json_errors.is_empty(), "JSON errors: {json_errors:?}");
+        let cli_commands = load_config_file(cli.to_string());
+        for (format, commands) in [
+            ("YAML", yaml_commands.clone()),
+            ("JSON", json_commands),
+            ("CLI", cli_commands),
+        ] {
+            assert!(
+                commands.iter().any(|line| line == expected_in),
+                "{format}: {commands:?}"
+            );
+            assert!(
+                commands.iter().any(|line| line == expected_out),
+                "{format}: {commands:?}"
+            );
+            assert!(
+                commands.iter().any(|line| line == expected_in_v6),
+                "{format}: {commands:?}"
+            );
+            assert!(
+                commands.iter().any(|line| line == expected_out_v6),
+                "{format}: {commands:?}"
+            );
+            for command in commands {
+                let (code, _, _) = parse(&command, configure.clone(), None, State::new());
+                assert_eq!(code, ExecCode::Success, "{format} must parse: {command}");
+            }
+        }
+
+        // Build the candidate twice from the same commands: keyed nodes and
+        // leaves remain singular. Then every running-config representation
+        // lowers back to the same prefix-set commands.
+        let root = Rc::new(Config::new(String::new(), None));
+        for _ in 0..2 {
+            for command in &yaml_commands {
+                let command = command.strip_prefix("set ").unwrap();
+                let (code, _, state) = parse(command, set_entry.clone(), None, State::new());
+                assert_eq!(code, ExecCode::Success, "must parse: {command}");
+                set(path_try_trim("set", state.paths), root.clone());
+            }
+        }
+        let mut validation_errors = Vec::new();
+        root.validate(&mut validation_errors);
+        assert!(
+            validation_errors.is_empty(),
+            "validation: {validation_errors:?}"
+        );
+
+        // Exact delete syntax, including the configured name, is accepted
+        // once the binding exists in the running config.
+        for command in [
+            expected_in.replacen("set ", "delete ", 1),
+            expected_out.replacen("set ", "delete ", 1),
+            expected_in_v6.replacen("set ", "delete ", 1),
+            expected_out_v6.replacen("set ", "delete ", 1),
+        ] {
+            let (code, _, _) = parse(
+                &command,
+                configure.clone(),
+                Some(root.clone()),
+                State::new(),
+            );
+            assert_eq!(code, ExecCode::Success, "must parse: {command}");
+        }
+
+        let mut formal = String::new();
+        root.list(&mut formal);
+        assert_eq!(
+            formal
+                .matches(expected_in.trim_start_matches("set "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            formal
+                .matches(expected_out.trim_start_matches("set "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            formal
+                .matches(expected_in_v6.trim_start_matches("set "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            formal
+                .matches(expected_out_v6.trim_start_matches("set "))
+                .count(),
+            1
+        );
+
+        let mut rendered_cli = String::new();
+        root.format(&mut rendered_cli);
+        let mut rendered_json = String::new();
+        root.json(&mut rendered_json);
+        let mut rendered_yaml = String::new();
+        root.yaml(&mut rendered_yaml);
+        let round_trips = [
+            ("CLI", load_config_file(rendered_cli)),
+            ("JSON", json_read(set_entry.clone(), &rendered_json).0),
+            ("YAML", yaml_read(set_entry, &rendered_yaml).0),
+        ];
+        for (format, commands) in round_trips {
+            assert!(
+                commands.iter().any(|line| line == expected_in),
+                "{format}: {commands:?}"
+            );
+            assert!(
+                commands.iter().any(|line| line == expected_out),
+                "{format}: {commands:?}"
+            );
+            assert!(
+                commands.iter().any(|line| line == expected_in_v6),
+                "{format}: {commands:?}"
+            );
+            assert!(
+                commands.iter().any(|line| line == expected_out_v6),
+                "{format}: {commands:?}"
             );
         }
     }

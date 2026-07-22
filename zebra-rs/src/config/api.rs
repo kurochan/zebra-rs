@@ -30,6 +30,13 @@ pub struct ConfigRequest {
     pub paths: Vec<CommandPath>,
     pub op: ConfigOp,
     pub resp: Option<Sender<Vec<String>>>,
+    /// Optional synchronous commit barrier.  The config manager uses this
+    /// only for the policy actor's CommitEnd so dependent protocol actors do
+    /// not observe bindings before the canonical policy snapshot is final.
+    pub commit_ack: Option<std::sync::mpsc::SyncSender<()>>,
+    /// Config-manager transaction generation. The same non-zero value is
+    /// carried to policy first and then every dependent protocol actor.
+    pub commit_generation: u64,
 }
 
 impl ConfigRequest {
@@ -38,6 +45,8 @@ impl ConfigRequest {
             paths,
             op,
             resp: None,
+            commit_ack: None,
+            commit_generation: 0,
         }
     }
 }

@@ -438,6 +438,7 @@ impl Policy {
     }
 
     async fn process_cm_msg(&mut self, msg: ConfigRequest) {
+        let commit_ack = msg.commit_ack.clone();
         match msg.op {
             ConfigOp::Set | ConfigOp::Delete => {
                 let (path, args) = path_from_command(&msg.paths);
@@ -548,6 +549,9 @@ impl Policy {
                 );
             }
             _ => {}
+        }
+        if let Some(commit_ack) = commit_ack {
+            let _ = commit_ack.send(());
         }
     }
 
