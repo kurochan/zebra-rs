@@ -219,6 +219,8 @@
 /router/bgp/vrf/label-mode
 /router/bgp/vrf/neighbor
 /router/bgp/vrf/neighbor/afi-safi/enabled
+/router/bgp/vrf/neighbor/afi-safi/prefix-set/in
+/router/bgp/vrf/neighbor/afi-safi/prefix-set/out
 /router/bgp/vrf/neighbor/description
 /router/bgp/vrf/neighbor/peer-group
 /router/bgp/vrf/neighbor/remote-as

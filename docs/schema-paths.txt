@@ -303,6 +303,9 @@
 /router/bgp/vrf/neighbor	list keys=remote-address
 /router/bgp/vrf/neighbor/afi-safi	list keys=name
 /router/bgp/vrf/neighbor/afi-safi/enabled	leaf
+/router/bgp/vrf/neighbor/afi-safi/prefix-set	container
+/router/bgp/vrf/neighbor/afi-safi/prefix-set/in	leaf
+/router/bgp/vrf/neighbor/afi-safi/prefix-set/out	leaf
 /router/bgp/vrf/neighbor/description	leaf
 /router/bgp/vrf/neighbor/peer-group	leaf
 /router/bgp/vrf/neighbor/remote-as	leaf

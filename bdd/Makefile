@@ -393,6 +393,10 @@ bgp_policy_dynamic_update:
 	mkdir -p allure-results
 	cargo test --test cucumber -- --concurrency=1 --tags "@bgp_policy_dynamic_update"
 
+bgp_vrf_prefix_set:
+	mkdir -p allure-results
+	cargo test --test cucumber -- --concurrency=1 --tags "@bgp_vrf_prefix_set"
+
 bgp_table_map:
 	mkdir -p allure-results
 	cargo test --test cucumber -- --concurrency=1 --tags "@bgp_table_map"

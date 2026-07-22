@@ -32,6 +32,7 @@ use crate::config::{Args, ConfigOp};
 
 use super::Bgp;
 use super::config::BgpRedistSource;
+use super::policy::InOut;
 use super::vrf::msg::BgpVrfMsg;
 use crate::rib::RedistAfi;
 
@@ -89,6 +90,52 @@ impl BgpVrfEncapsulation {
 /// `router bgp vrf X neighbor <addr>`. Mirrors `bgp-vrf-neighbor` in
 /// zebra-bgp-vrf.yang.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BgpVrfPrefixSetConfig {
+    pub input: Option<String>,
+    pub output: Option<String>,
+}
+
+impl BgpVrfPrefixSetConfig {
+    fn get(&self, direction: InOut) -> &Option<String> {
+        match direction {
+            InOut::Input => &self.input,
+            InOut::Output => &self.output,
+        }
+    }
+
+    fn get_mut(&mut self, direction: InOut) -> &mut Option<String> {
+        match direction {
+            InOut::Input => &mut self.input,
+            InOut::Output => &mut self.output,
+        }
+    }
+}
+
+/// First-observed state for one per-VRF prefix-set binding during a config
+/// transaction.  Config replacement arrives as Delete followed by Set; keeping
+/// the value from before the first callback lets `CommitEnd` publish only the
+/// final binding, without exposing the intermediate unbound state to the live
+/// VRF task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingVrfPrefixSetChange {
+    vrf: String,
+    address: IpAddr,
+    afi_safi: AfiSafi,
+    direction: InOut,
+    before: Option<String>,
+}
+
+/// Final, net changes produced from a config transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VrfPrefixSetChange {
+    vrf: String,
+    address: IpAddr,
+    afi_safi: AfiSafi,
+    direction: InOut,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BgpVrfNeighborConfig {
     pub remote_as: Option<u32>,
     pub peer_group: Option<String>,
@@ -99,9 +146,8 @@ pub struct BgpVrfNeighborConfig {
     /// unicast families are reachable from the schema. Empty means "no
     /// explicit override": the negotiated family is then derived from
     /// the peer's own address family in `materialize_peers`. There is
-    /// no neighbor-group afi-safi inheritance for CE peers yet (the
-    /// stored `peer_group` is not resolved at materialization), so this
-    /// map is the only override layer.
+    /// Neighbor-group AFI/SAFI opinions are resolved at materialization
+    /// beneath this map, so an explicit per-neighbor statement wins.
     pub mp_explicit: BTreeMap<AfiSafi, bool>,
     /// Staged `timers { … }` for this CE peer, copied verbatim onto
     /// [`super::peer::PeerConfig::timer`] by `materialize_peers`.
@@ -114,6 +160,10 @@ pub struct BgpVrfNeighborConfig {
     /// neighbor. Sharing the type means wiring one of those up later
     /// is a schema-only change here.
     pub timer: super::timer::Config,
+    /// Per-family inbound/outbound named prefix-set references. Names stay
+    /// staged even while unresolved; the running per-VRF task resolves them
+    /// through the policy actor and treats an unresolved binding as deny-all.
+    pub prefix_set: BTreeMap<AfiSafi, BgpVrfPrefixSetConfig>,
 }
 
 /// Per-AFI knobs under `router bgp vrf X afi-safi {ipv4,ipv6}-unicast`.
@@ -294,8 +344,9 @@ pub struct BgpVrfConfig {
 }
 
 /// Whether two candidate configs materialize the same long-lived VRF task.
-/// Network/redistribution and MUP route changes have dedicated runtime
-/// messages/reconciliation and must not reset CE sessions.
+/// Prefix-set bindings are deliberately excluded: they have an atomic live
+/// update path. Network/redistribution and MUP route changes likewise have
+/// dedicated runtime messages/reconciliation and must not reset CE sessions.
 pub(crate) fn runtime_structure_eq(
     before: &BgpVrfConfig,
     before_groups: &BTreeMap<String, super::neighbor_group::NeighborGroup>,
@@ -308,6 +359,7 @@ pub(crate) fn runtime_structure_eq(
                 .iter()
                 .map(|(address, neighbor)| {
                     let mut neighbor = neighbor.clone();
+                    neighbor.prefix_set.clear();
 
                     // Compare what materialize_peers actually puts on the wire,
                     // not the spelling of the activation intent. For an IPv4
@@ -788,8 +840,10 @@ pub fn config_vrf_neighbor_idle_hold_time(
 /// staged [`BgpVrfNeighborConfig::mp_explicit`]; `materialize_peers`
 /// resolves the effective family set (address-derived default layered
 /// with these overrides) when it builds the peer. The capability set is
-/// fixed at OPEN time, so a change only takes effect when the CE session
-/// next renegotiates (`clear bgp`).
+/// fixed at OPEN time, so a real effective-family change drives the
+/// structural commit diff and re-materializes the affected VRF task. A
+/// representation-only change (for example implicit IPv4 to explicit
+/// `ipv4 enabled true`) compares equal and does not reset the session.
 pub fn config_vrf_neighbor_afi_safi_enabled(
     bgp: &mut Bgp,
     mut args: Args,
@@ -811,6 +865,163 @@ pub fn config_vrf_neighbor_afi_safi_enabled(
         _ => {}
     }
     Some(())
+}
+
+/// Common callback for
+/// `router bgp vrf <NAME> neighbor <addr> afi-safi <afi> prefix-set {in,out}`.
+/// Staging is diff-gated so a repeated value is a no-op even if this helper is
+/// called outside the config manager's normal text-diff commit path. Changes
+/// for a live VRF are coalesced and delivered at `CommitEnd`; a not-yet-running
+/// VRF uses the staged value when its peers materialize.
+fn config_vrf_neighbor_afi_safi_prefix_set(
+    bgp: &mut Bgp,
+    mut args: Args,
+    op: ConfigOp,
+    direction: InOut,
+) -> Option<()> {
+    let vrf = args.string()?;
+    let address = args.addr()?;
+    let afi_safi: AfiSafi = args.afi_safi()?;
+    let name = match op {
+        ConfigOp::Set => Some(args.string()?),
+        ConfigOp::Delete => None,
+        _ => return Some(()),
+    };
+
+    let changed = {
+        let cfg = vrf_entry(bgp, vrf.clone(), op)?;
+        update_neighbor_prefix_set(cfg, address, afi_safi, direction, name.clone(), op)
+    };
+
+    if let Some(before) = changed {
+        record_pending_prefix_set_change(
+            &mut bgp.vrf_prefix_set_pending,
+            PendingVrfPrefixSetChange {
+                vrf,
+                address,
+                afi_safi,
+                direction,
+                before,
+            },
+        );
+    }
+    Some(())
+}
+
+fn record_pending_prefix_set_change(
+    pending: &mut Vec<PendingVrfPrefixSetChange>,
+    change: PendingVrfPrefixSetChange,
+) {
+    if !pending.iter().any(|existing| {
+        existing.vrf == change.vrf
+            && existing.address == change.address
+            && existing.afi_safi == change.afi_safi
+            && existing.direction == change.direction
+    }) {
+        pending.push(change);
+    }
+}
+
+/// Update one staged binding and return its previous value when it changed.
+/// Delete callbacks must only traverse existing containers: after the parent
+/// neighbor list callback removes an entry, subsequently delivered child
+/// deletes must not recreate that neighbor (or its AFI container).
+fn update_neighbor_prefix_set(
+    cfg: &mut BgpVrfConfig,
+    address: IpAddr,
+    afi_safi: AfiSafi,
+    direction: InOut,
+    name: Option<String>,
+    op: ConfigOp,
+) -> Option<Option<String>> {
+    let prefix_set = match op {
+        ConfigOp::Set => cfg
+            .neighbors
+            .entry(address)
+            .or_default()
+            .prefix_set
+            .entry(afi_safi)
+            .or_default(),
+        ConfigOp::Delete => cfg
+            .neighbors
+            .get_mut(&address)?
+            .prefix_set
+            .get_mut(&afi_safi)?,
+        _ => return None,
+    };
+    let slot = prefix_set.get_mut(direction);
+    if *slot == name {
+        None
+    } else {
+        let before = slot.clone();
+        *slot = name;
+        Some(before)
+    }
+}
+
+fn take_prefix_set_commit_changes(
+    vrfs: &BTreeMap<String, BgpVrfConfig>,
+    pending: &mut Vec<PendingVrfPrefixSetChange>,
+) -> Vec<VrfPrefixSetChange> {
+    std::mem::take(pending)
+        .into_iter()
+        .filter_map(|change| {
+            let name = vrfs
+                .get(&change.vrf)
+                .and_then(|cfg| cfg.neighbors.get(&change.address))
+                .and_then(|neighbor| neighbor.prefix_set.get(&change.afi_safi))
+                .and_then(|prefix_set| prefix_set.get(change.direction).clone());
+            (name != change.before).then_some(VrfPrefixSetChange {
+                vrf: change.vrf,
+                address: change.address,
+                afi_safi: change.afi_safi,
+                direction: change.direction,
+                name,
+            })
+        })
+        .collect()
+}
+
+/// Publish coalesced per-VRF prefix-set binding changes at the transaction
+/// boundary.  In particular, a Delete+Set replacement becomes one message
+/// carrying the new name; live peers never run temporarily without a filter.
+pub(crate) fn apply_prefix_set_commit_changes(bgp: &mut Bgp, generation: u64) {
+    let changes = take_prefix_set_commit_changes(&bgp.vrfs, &mut bgp.vrf_prefix_set_pending);
+    for change in changes {
+        if let Some(handle) = bgp.vrf_registry.get(&change.vrf) {
+            let _ = handle.inbox.send(BgpVrfMsg::PrefixSetConfig {
+                address: change.address,
+                afi_safi: change.afi_safi,
+                direction: change.direction,
+                name: change.name,
+                generation,
+            });
+        }
+    }
+    // One FIFO marker per live VRF, after every binding message above.  A
+    // policy commit emits its watch batch before ConfigManager releases BGP's
+    // CommitEnd barrier, so this closes the same transaction on both actors.
+    for handle in bgp.vrf_registry.values() {
+        let _ = handle
+            .inbox
+            .send(BgpVrfMsg::PrefixSetCommitEnd { generation });
+    }
+}
+
+pub fn config_vrf_neighbor_afi_safi_prefix_set_in(
+    bgp: &mut Bgp,
+    args: Args,
+    op: ConfigOp,
+) -> Option<()> {
+    config_vrf_neighbor_afi_safi_prefix_set(bgp, args, op, InOut::Input)
+}
+
+pub fn config_vrf_neighbor_afi_safi_prefix_set_out(
+    bgp: &mut Bgp,
+    args: Args,
+    op: ConfigOp,
+) -> Option<()> {
+    config_vrf_neighbor_afi_safi_prefix_set(bgp, args, op, InOut::Output)
 }
 
 /// `set router bgp vrf <NAME> afi-safi ipv4` — presence container.
@@ -1227,6 +1438,35 @@ mod tests {
         cfg.neighbors.entry(addr).or_default()
     }
 
+    fn stage_prefix_set(
+        vrfs: &mut BTreeMap<String, BgpVrfConfig>,
+        pending: &mut Vec<PendingVrfPrefixSetChange>,
+        address: IpAddr,
+        name: Option<&str>,
+        op: ConfigOp,
+    ) {
+        let cfg = vrfs.get_mut("blue").unwrap();
+        if let Some(before) = update_neighbor_prefix_set(
+            cfg,
+            address,
+            AfiSafi::new(Afi::Ip, Safi::Unicast),
+            InOut::Output,
+            name.map(str::to_string),
+            op,
+        ) {
+            record_pending_prefix_set_change(
+                pending,
+                PendingVrfPrefixSetChange {
+                    vrf: "blue".to_string(),
+                    address,
+                    afi_safi: AfiSafi::new(Afi::Ip, Safi::Unicast),
+                    direction: InOut::Output,
+                    before,
+                },
+            );
+        }
+    }
+
     #[test]
     fn label_mode_parse_accepts_yang_enums() {
         assert_eq!(
@@ -1265,6 +1505,55 @@ mod tests {
             BgpVrfConfig::default().encapsulation,
             BgpVrfEncapsulation::Mpls
         );
+    }
+
+    #[test]
+    fn barrier_rollback_makes_identical_prefix_set_retry_publish_once() {
+        let address: IpAddr = "192.0.2.1".parse().unwrap();
+        let mut vrfs = BTreeMap::from([("blue".to_string(), BgpVrfConfig::default())]);
+        let mut pending = Vec::new();
+
+        // Committed/runtime value before the rejected transaction.
+        stage_prefix_set(&mut vrfs, &mut pending, address, Some("OLD"), ConfigOp::Set);
+        pending.clear();
+
+        // Candidate OLD -> DENY was delivered, but policy ACK failed before
+        // BGP CommitEnd.  The manager replays the inverse in reverse order.
+        stage_prefix_set(&mut vrfs, &mut pending, address, None, ConfigOp::Delete);
+        stage_prefix_set(
+            &mut vrfs,
+            &mut pending,
+            address,
+            Some("DENY"),
+            ConfigOp::Set,
+        );
+        stage_prefix_set(&mut vrfs, &mut pending, address, None, ConfigOp::Delete);
+        stage_prefix_set(&mut vrfs, &mut pending, address, Some("OLD"), ConfigOp::Set);
+
+        // The inverse CommitEnd closes the rollback generation.  Its net
+        // binding diff is empty, so the live task receives no policy change;
+        // the following CommitStart only captures this restored baseline.
+        assert!(take_prefix_set_commit_changes(&vrfs, &mut pending).is_empty());
+        assert_eq!(
+            vrfs["blue"].neighbors[&address].prefix_set[&AfiSafi::new(Afi::Ip, Safi::Unicast)]
+                .output
+                .as_deref(),
+            Some("OLD")
+        );
+
+        // Identical candidate retry must not collapse to a callback no-op.
+        stage_prefix_set(&mut vrfs, &mut pending, address, None, ConfigOp::Delete);
+        stage_prefix_set(
+            &mut vrfs,
+            &mut pending,
+            address,
+            Some("DENY"),
+            ConfigOp::Set,
+        );
+        let published = take_prefix_set_commit_changes(&vrfs, &mut pending);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].name.as_deref(), Some("DENY"));
+        assert!(take_prefix_set_commit_changes(&vrfs, &mut pending).is_empty());
     }
 
     #[test]
@@ -1326,6 +1615,7 @@ mod tests {
         assert!(nbr.timer.connect_retry_time.is_none());
         assert!(nbr.timer.hold_time.is_none());
         assert!(nbr.timer.idle_hold_time.is_none());
+        assert!(nbr.prefix_set.is_empty());
     }
 
     #[test]
@@ -1373,22 +1663,186 @@ mod tests {
     }
 
     #[test]
-    fn neighbor_child_deletes_do_not_recreate_a_removed_neighbor() {
-        let address: IpAddr = "192.0.2.1".parse().unwrap();
-        let mut cfg = BgpVrfConfig::default();
-        cfg.neighbors.entry(address).or_default().remote_as = Some(65001);
+    fn neighbor_prefix_sets_are_scoped_by_family_and_direction() {
+        use bgp_packet::{Afi, Safi};
 
-        // The list callback runs first when the whole neighbor is deleted.
-        // Trailing child callbacks must traverse existing state only.
-        cfg.neighbors.remove(&address);
-        for _ in 0..4 {
-            assert!(neighbor_entry(&mut cfg, address, ConfigOp::Delete).is_none());
-        }
+        let mut nbr = BgpVrfNeighborConfig::default();
+        let ipv4 = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let ipv6 = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+
+        nbr.prefix_set.entry(ipv4).or_default().input = Some("PEER-IN-V4".to_string());
+        nbr.prefix_set.entry(ipv4).or_default().output = Some("PEER-OUT-V4".to_string());
+        nbr.prefix_set.entry(ipv6).or_default().input = Some("PEER-IN-V6".to_string());
+
+        let v4 = nbr.prefix_set.get(&ipv4).unwrap();
+        assert_eq!(v4.input.as_deref(), Some("PEER-IN-V4"));
+        assert_eq!(v4.output.as_deref(), Some("PEER-OUT-V4"));
+        let v6 = nbr.prefix_set.get(&ipv6).unwrap();
+        assert_eq!(v6.input.as_deref(), Some("PEER-IN-V6"));
+        assert!(v6.output.is_none());
+
+        nbr.prefix_set.get_mut(&ipv4).unwrap().input = None;
+        assert!(nbr.prefix_set.get(&ipv4).unwrap().input.is_none());
+        assert_eq!(
+            nbr.prefix_set.get(&ipv4).unwrap().output.as_deref(),
+            Some("PEER-OUT-V4")
+        );
+        assert_eq!(
+            nbr.prefix_set.get(&ipv6).unwrap().input.as_deref(),
+            Some("PEER-IN-V6")
+        );
+    }
+
+    #[test]
+    fn prefix_set_replacement_is_coalesced_to_final_name_at_commit() {
+        use bgp_packet::{Afi, Safi};
+
+        let vrf = "blue".to_string();
+        let address: IpAddr = "192.0.2.1".parse().unwrap();
+        let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let mut vrfs = BTreeMap::new();
+        let mut cfg = BgpVrfConfig::default();
+        cfg.neighbors
+            .entry(address)
+            .or_default()
+            .prefix_set
+            .entry(afi_safi)
+            .or_default()
+            .input = Some("NEW".to_string());
+        vrfs.insert(vrf.clone(), cfg);
+
+        // A value replacement is observed as Delete(OLD), Set(NEW). Only the
+        // state before the first callback is retained in the pending record.
+        let mut pending = Vec::new();
+        record_pending_prefix_set_change(
+            &mut pending,
+            PendingVrfPrefixSetChange {
+                vrf: vrf.clone(),
+                address,
+                afi_safi,
+                direction: InOut::Input,
+                before: Some("OLD".to_string()),
+            },
+        );
+        record_pending_prefix_set_change(
+            &mut pending,
+            PendingVrfPrefixSetChange {
+                vrf: vrf.clone(),
+                address,
+                afi_safi,
+                direction: InOut::Input,
+                before: None,
+            },
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].before.as_deref(), Some("OLD"));
+        let changes = take_prefix_set_commit_changes(&vrfs, &mut pending);
+
+        assert!(pending.is_empty());
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].vrf, vrf);
+        assert_eq!(changes[0].name.as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn prefix_set_delete_then_restore_is_not_published() {
+        use bgp_packet::{Afi, Safi};
+
+        let vrf = "blue".to_string();
+        let address: IpAddr = "192.0.2.1".parse().unwrap();
+        let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let mut vrfs = BTreeMap::new();
+        let mut cfg = BgpVrfConfig::default();
+        cfg.neighbors
+            .entry(address)
+            .or_default()
+            .prefix_set
+            .entry(afi_safi)
+            .or_default()
+            .input = Some("SAME".to_string());
+        vrfs.insert(vrf.clone(), cfg);
+
+        let mut pending = vec![PendingVrfPrefixSetChange {
+            vrf,
+            address,
+            afi_safi,
+            direction: InOut::Input,
+            before: Some("SAME".to_string()),
+        }];
+
+        assert!(take_prefix_set_commit_changes(&vrfs, &mut pending).is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn prefix_set_child_delete_does_not_recreate_removed_neighbor() {
+        use bgp_packet::{Afi, Safi};
+
+        let address: IpAddr = "192.0.2.1".parse().unwrap();
+        let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let mut cfg = BgpVrfConfig::default();
+
+        // Models callback order for deleting the whole neighbor list entry:
+        // the parent callback removed it before this child-leaf delete runs.
+        assert!(
+            update_neighbor_prefix_set(
+                &mut cfg,
+                address,
+                afi_safi,
+                InOut::Input,
+                None,
+                ConfigOp::Delete,
+            )
+            .is_none()
+        );
         assert!(cfg.neighbors.is_empty());
     }
 
     #[test]
-    fn neighbor_child_set_can_create_before_the_list_key_callback() {
+    fn whole_neighbor_delete_child_callbacks_leave_no_ghost_or_dirty_diff() {
+        use bgp_packet::{Afi, Safi};
+
+        let address: IpAddr = "192.0.2.1".parse().unwrap();
+        let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let mut cfg = BgpVrfConfig::default();
+        let neighbor = cfg.neighbors.entry(address).or_default();
+        neighbor.remote_as = Some(65001);
+        neighbor.peer_group = Some("CE".to_string());
+        neighbor.description = Some("deleted peer".to_string());
+        neighbor.mp_explicit.insert(afi_safi, true);
+        neighbor.prefix_set.entry(afi_safi).or_default().input = Some("CE-IN".to_string());
+
+        // A whole-list delete removes the parent first. Every child callback
+        // may still follow, but none may lazily create the neighbor again.
+        cfg.neighbors.remove(&address);
+        assert!(neighbor_entry(&mut cfg, address, ConfigOp::Delete).is_none());
+        assert!(neighbor_entry(&mut cfg, address, ConfigOp::Delete).is_none());
+        assert!(neighbor_entry(&mut cfg, address, ConfigOp::Delete).is_none());
+        assert!(neighbor_entry(&mut cfg, address, ConfigOp::Delete).is_none());
+        assert!(
+            update_neighbor_prefix_set(
+                &mut cfg,
+                address,
+                afi_safi,
+                InOut::Input,
+                None,
+                ConfigOp::Delete,
+            )
+            .is_none()
+        );
+        assert!(cfg.neighbors.is_empty());
+
+        // The resulting staged shape is exactly a clean neighbor-free
+        // runtime baseline, so the next unchanged commit has no structural
+        // respawn diff caused by a default-valued ghost entry.
+        let clean = BgpVrfConfig::default();
+        let groups = BTreeMap::new();
+        assert!(runtime_structure_eq(&clean, &groups, &cfg, &groups));
+        assert!(runtime_structure_eq(&cfg, &groups, &cfg.clone(), &groups));
+    }
+
+    #[test]
+    fn neighbor_child_set_can_still_create_before_list_key_callback() {
         let address: IpAddr = "192.0.2.1".parse().unwrap();
         let mut cfg = BgpVrfConfig::default();
 

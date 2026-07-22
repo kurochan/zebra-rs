@@ -44,6 +44,11 @@ pub enum Message {
         proto: String,
         tx: UnboundedSender<PolicyRx>,
     },
+    /// Drop a protocol client and every watch it registered. Per-VRF BGP
+    /// tasks use a distinct protocol name and can be respawned frequently;
+    /// without whole-client cleanup, stale watches can target a new task
+    /// whose local peer indexes happen to be reused.
+    Unsubscribe { proto: String },
     Register {
         proto: String,
         name: String,
@@ -66,7 +71,26 @@ pub enum Message {
 // Message from rib to protocol module.
 #[derive(Debug, PartialEq)]
 pub enum PolicyRx {
+    /// Start of one policy commit's prefix-set notification batch.  Direct
+    /// watch updates following this message must not be applied by per-VRF
+    /// BGP until its own CommitEnd marker arrives: the same transaction may
+    /// rebind that watch to another name.
+    PrefixSetCommitStart { generation: u64 },
+    /// Canonical prefix-set inventory after one policy CommitEnd.  Per-VRF
+    /// BGP uses this to distinguish a known replacement (atomic object swap)
+    /// from an unknown replacement (immediate fail-close) without waiting
+    /// for an asynchronous per-watch resolve reply.
+    PrefixSetInventory {
+        generation: u64,
+        prefix_sets: BTreeMap<String, PrefixSet>,
+    },
     PrefixSet {
+        /// Prefix-set registry generation from which this object was
+        /// resolved.  Register replies are tagged as well as commit-driven
+        /// watch updates: otherwise a Register processed after the policy
+        /// actor has advanced can expose the next commit before the
+        /// subscribing protocol receives its matching CommitEnd.
+        generation: u64,
         name: String,
         ident: usize,
         policy_type: PolicyType,
@@ -121,6 +145,7 @@ pub trait Syncer {
 pub struct PolicySyncer<'a> {
     watch_map: &'a BTreeMap<String, Vec<PolicyWatch>>,
     clients: &'a BTreeMap<String, UnboundedSender<PolicyRx>>,
+    generation: u64,
 }
 
 /// `Syncer` used by the key-chain commit path. Unlike prefix-set /
@@ -140,6 +165,7 @@ impl<'a> Syncer for PolicySyncer<'a> {
             for watch in watches {
                 if let Some(tx) = self.clients.get(&watch.proto) {
                     let msg = PolicyRx::PrefixSet {
+                        generation: self.generation,
                         name: name.to_string(),
                         ident: watch.ident,
                         policy_type: watch.policy_type,
@@ -156,6 +182,7 @@ impl<'a> Syncer for PolicySyncer<'a> {
             for watch in watches {
                 if let Some(tx) = self.clients.get(&watch.proto) {
                     let msg = PolicyRx::PrefixSet {
+                        generation: self.generation,
                         name: name.to_string(),
                         ident: watch.ident,
                         policy_type: watch.policy_type,
@@ -254,6 +281,7 @@ pub struct Policy {
     pub watch_prefix: BTreeMap<String, Vec<PolicyWatch>>,
     pub watch_policy: BTreeMap<String, Vec<PolicyWatch>>,
     pub watch_keychain: BTreeMap<String, Vec<PolicyWatch>>,
+    prefix_set_generation: u64,
 }
 
 #[derive(Debug)]
@@ -283,6 +311,7 @@ impl Policy {
             watch_prefix: BTreeMap::new(),
             watch_policy: BTreeMap::new(),
             watch_keychain: BTreeMap::new(),
+            prefix_set_generation: 0,
         };
         policy.show_build();
         policy
@@ -291,7 +320,26 @@ impl Policy {
     async fn process_msg(&mut self, msg: Message) {
         match msg {
             Message::Subscribe { proto, tx } => {
+                if proto.starts_with("bgp:vrf:") {
+                    let _ = tx.send(PolicyRx::PrefixSetInventory {
+                        generation: self.prefix_set_generation,
+                        prefix_sets: self.prefix_config.config.clone(),
+                    });
+                }
                 self.clients.insert(proto, tx);
+            }
+            Message::Unsubscribe { proto } => {
+                self.clients.remove(&proto);
+                for watches in [
+                    &mut self.watch_prefix,
+                    &mut self.watch_policy,
+                    &mut self.watch_keychain,
+                ] {
+                    watches.retain(|_, entries| {
+                        entries.retain(|watch| watch.proto != proto);
+                        !entries.is_empty()
+                    });
+                }
             }
             Message::Register {
                 proto,
@@ -299,6 +347,13 @@ impl Policy {
                 ident,
                 policy_type,
             } => {
+                // A task from a despawned protocol incarnation can still
+                // have messages queued behind its Unsubscribe.  Never retain
+                // a watch when there is no matching live client; in
+                // particular it must not attach to a later respawn.
+                if !self.clients.contains_key(&proto) {
+                    return;
+                }
                 match policy_type {
                     PolicyType::PrefixSetIn | PolicyType::PrefixSetOut => {
                         // Always answer, even when the named set is
@@ -311,6 +366,7 @@ impl Policy {
                         let prefix_set = self.prefix_config.config.get(&name).cloned();
                         if let Some(tx) = self.clients.get(&proto) {
                             let msg = PolicyRx::PrefixSet {
+                                generation: self.prefix_set_generation,
                                 name: name.clone(),
                                 ident,
                                 policy_type,
@@ -412,6 +468,7 @@ impl Policy {
                 let reply = match policy_type {
                     PolicyType::PrefixSetIn | PolicyType::PrefixSetOut => {
                         Some(PolicyRx::PrefixSet {
+                            generation: self.prefix_set_generation,
                             name,
                             ident,
                             policy_type,
@@ -479,16 +536,43 @@ impl Policy {
                 let changed_policies: std::collections::BTreeSet<String> =
                     self.policy_config.cache.keys().cloned().collect();
 
+                // Delimit direct prefix-set watch notifications. Per-VRF BGP
+                // buffers everything in this batch until BGP's own CommitEnd
+                // marker, so a body edit of OLD cannot transiently replay OLD
+                // when this same transaction rebinds OLD -> NEW.
+                let next_prefix_set_generation = if msg.commit_generation == 0 {
+                    self.prefix_set_generation.wrapping_add(1)
+                } else {
+                    msg.commit_generation
+                };
+                for (proto, tx) in &self.clients {
+                    if proto.starts_with("bgp:vrf:") {
+                        let _ = tx.send(PolicyRx::PrefixSetCommitStart {
+                            generation: next_prefix_set_generation,
+                        });
+                    }
+                }
+
                 // Sync prefix-set.
                 let syncer = PolicySyncer {
                     watch_map: &self.watch_prefix,
                     clients: &self.clients,
+                    generation: next_prefix_set_generation,
                 };
                 PrefixSetConfig::commit(
                     &mut self.prefix_config.config,
                     &mut self.prefix_config.cache,
                     syncer,
                 );
+                self.prefix_set_generation = next_prefix_set_generation;
+                for (proto, tx) in &self.clients {
+                    if proto.starts_with("bgp:vrf:") {
+                        let _ = tx.send(PolicyRx::PrefixSetInventory {
+                            generation: self.prefix_set_generation,
+                            prefix_sets: self.prefix_config.config.clone(),
+                        });
+                    }
+                }
                 // Sync key-chain. No cascade: key-chains aren't
                 // referenced from any other policy entity, so a chain
                 // edit only fans out to its direct subscribers.
@@ -514,6 +598,7 @@ impl Policy {
                 let syncer = PolicySyncer {
                     watch_map: &self.watch_policy,
                     clients: &self.clients,
+                    generation: self.prefix_set_generation,
                 };
                 PolicyConfig::commit(
                     &mut self.policy_config.config,
@@ -679,6 +764,36 @@ pub fn serve(mut policy: Policy) {
 mod unregister_reply_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn register_after_unsubscribe_cannot_recreate_stale_watch() {
+        let mut policy = Policy::new();
+        let (old_tx, _old_rx) = mpsc::unbounded_channel::<PolicyRx>();
+        policy
+            .process_msg(Message::Subscribe {
+                proto: "bgp:vrf:blue:policy:1".to_string(),
+                tx: old_tx,
+            })
+            .await;
+        policy
+            .process_msg(Message::Unsubscribe {
+                proto: "bgp:vrf:blue:policy:1".to_string(),
+            })
+            .await;
+
+        // This is a queued message from the aborted old task.  The new task
+        // has a different identity, and an absent old client makes Register
+        // a no-op rather than leaving an orphan watcher behind.
+        policy
+            .process_msg(Message::Register {
+                proto: "bgp:vrf:blue:policy:1".to_string(),
+                name: "OLD".to_string(),
+                ident: 7,
+                policy_type: PolicyType::PrefixSetIn,
+            })
+            .await;
+        assert!(!policy.watch_prefix.contains_key("OLD"));
+    }
+
     /// Review finding #12: an out-policy *delete* must push a resolve
     /// reply carrying `None` so the subscriber clears its cached
     /// snapshot and re-advertises the routes the removed policy had
@@ -774,5 +889,117 @@ mod unregister_reply_tests {
             })
             .await;
         assert!(rx.try_recv().is_err(), "key-chain unbind pushes nothing");
+    }
+
+    #[tokio::test]
+    async fn vrf_subscriber_receives_initial_and_commit_final_prefix_inventory() {
+        use ipnet::IpNet;
+
+        use crate::policy::prefix::set::PrefixSetEntry;
+
+        let mut policy = Policy::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<PolicyRx>();
+        policy
+            .process_msg(Message::Subscribe {
+                proto: "bgp:vrf:blue".to_string(),
+                tx,
+            })
+            .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PolicyRx::PrefixSetInventory {
+                generation: 0,
+                prefix_sets,
+            }) if prefix_sets.is_empty()
+        ));
+
+        let mut set = PrefixSet::default();
+        set.insert(
+            "198.51.100.0/24".parse::<IpNet>().unwrap(),
+            PrefixSetEntry::default(),
+        );
+        policy
+            .prefix_config
+            .cache
+            .insert("NEW".to_string(), set.clone());
+        policy
+            .process_cm_msg(ConfigRequest::new(Vec::new(), ConfigOp::CommitEnd))
+            .await;
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PolicyRx::PrefixSetCommitStart { generation: 1 })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PolicyRx::PrefixSetInventory {
+                generation: 1,
+                prefix_sets,
+            }) if prefix_sets.get("NEW") == Some(&set)
+        ));
+    }
+
+    #[tokio::test]
+    async fn register_reply_uses_actor_current_prefix_set_generation() {
+        use ipnet::IpNet;
+
+        use crate::policy::prefix::set::PrefixSetEntry;
+
+        let mut policy = Policy::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<PolicyRx>();
+        policy
+            .process_msg(Message::Subscribe {
+                proto: "bgp:vrf:blue".to_string(),
+                tx,
+            })
+            .await;
+        let _ = rx.try_recv(); // generation 0 inventory
+
+        let mut first = PrefixSet::default();
+        first.insert(
+            "198.51.100.0/24".parse::<IpNet>().unwrap(),
+            PrefixSetEntry::default(),
+        );
+        policy.prefix_config.cache.insert("NEW".to_string(), first);
+        policy
+            .process_cm_msg(ConfigRequest::new(Vec::new(), ConfigOp::CommitEnd))
+            .await;
+        let _ = rx.try_recv(); // generation 1 start
+        let _ = rx.try_recv(); // generation 1 inventory
+
+        let mut second = PrefixSet::default();
+        second.insert(
+            "203.0.113.0/24".parse::<IpNet>().unwrap(),
+            PrefixSetEntry::default(),
+        );
+        policy
+            .prefix_config
+            .cache
+            .insert("NEW".to_string(), second.clone());
+        policy
+            .process_cm_msg(ConfigRequest::new(Vec::new(), ConfigOp::CommitEnd))
+            .await;
+        let _ = rx.try_recv(); // generation 2 start
+        let _ = rx.try_recv(); // generation 2 inventory
+
+        // Models a Register from BGP commit 1 which reaches the actor only
+        // after the actor has already published commit 2.
+        policy
+            .process_msg(Message::Register {
+                proto: "bgp:vrf:blue".to_string(),
+                name: "NEW".to_string(),
+                ident: 17,
+                policy_type: PolicyType::PrefixSetIn,
+            })
+            .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PolicyRx::PrefixSet {
+                generation: 2,
+                ident: 17,
+                prefix_set: Some(prefix_set),
+                ..
+            }) if prefix_set == second
+        ));
     }
 }

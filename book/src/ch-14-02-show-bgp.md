@@ -221,7 +221,7 @@ attributes: [ { refcnt, store, attr } ] }`.
 
 ## Per-VRF BGP
 
-### `show bgp vrf [<name>] [summary|neighbor|ipv4|ipv6|mup]`
+### `show bgp vrf [<name>] [summary|neighbor [<address>]|ipv4|ipv6|mup]`
 
 With no name, a table of every BGP VRF — its RD, per-VRF label,
 table-id, peer count, and running state. With a `<name>` and a
@@ -239,3 +239,11 @@ red   65000:200   1002   257       1      running
 JSON (the no-name list): an array of
 `{ name, rd, label, table_id, peers, running }`. The per-VRF
 subcommands return their sibling's JSON shape.
+
+`show bgp vrf <name> neighbor` renders every CE neighbor in the VRF;
+an address selects one neighbor. Per-AFI route-policy and prefix-set
+bindings appear under `Address family`. An unresolved prefix-set is
+shown with an `(unresolved)` suffix. In JSON, each entry in
+`policy_bindings` contains the configured names and the corresponding
+`prefix_set_in_resolved` / `prefix_set_out_resolved` status when that
+direction is configured.

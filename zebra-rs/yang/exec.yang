@@ -566,9 +566,14 @@ module exec {
           ext:help "Summary of this VRF's BGP neighbor status";
           type empty;
         }
-        leaf neighbor {
+        list neighbor {
           ext:help "Detailed information on this VRF's BGP neighbors";
-          type empty;
+          ext:presence "Detailed information on every neighbor in this VRF";
+          key address;
+          leaf address {
+            ext:help "Neighbor IPv4 or IPv6 address";
+            type inet:ip-address;
+          }
         }
         leaf mup {
           ext:help "This VRF's BGP Mobile User Plane (MUP) RIB";

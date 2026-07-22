@@ -80,3 +80,88 @@ router bgp {
 
 The next three sections cover control flow, match, and set in
 detail, with worked examples for every clause.
+
+## Per-VRF BGP neighbor prefix-sets
+
+A BGP neighbor inside a VRF can bind a named prefix-set independently
+for each address family and direction. Only matching prefixes are
+accepted or advertised. A configured name that does not currently
+resolve is fail-close: no routes pass that direction until the
+prefix-set exists. With no binding, the existing unfiltered behavior is
+preserved.
+
+```yaml
+prefix-set:
+- name: PEER-IN-V4
+  prefixes:
+  - prefix: 0.0.0.0/0
+  - prefix: 203.0.113.0/24
+    le: 32
+- name: PEER-OUT-V4
+  prefixes:
+  - prefix: 198.51.100.0/24
+
+router:
+  bgp:
+    global:
+      as: 65001
+      router-id: 192.0.2.1
+    vrf:
+    - name: vrf-blue
+      neighbor:
+      - remote-address: 192.0.2.2
+        remote-as: 65002
+        afi-safi:
+        - name: ipv4
+          enabled: true
+          prefix-set:
+            in: PEER-IN-V4
+            out: PEER-OUT-V4
+```
+
+The equivalent block configuration is:
+
+```console
+router bgp {
+    vrf vrf-blue {
+        neighbor 192.0.2.2 {
+            remote-as 65002;
+            afi-safi ipv4 {
+                enabled true;
+                prefix-set {
+                    in PEER-IN-V4;
+                    out PEER-OUT-V4;
+                }
+            }
+        }
+    }
+}
+```
+
+The set/delete forms address one direction at a time:
+
+```console
+set router bgp vrf vrf-blue neighbor 192.0.2.2 afi-safi ipv4 prefix-set in PEER-IN-V4
+set router bgp vrf vrf-blue neighbor 192.0.2.2 afi-safi ipv4 prefix-set out PEER-OUT-V4
+delete router bgp vrf vrf-blue neighbor 192.0.2.2 afi-safi ipv4 prefix-set in PEER-IN-V4
+delete router bgp vrf vrf-blue neighbor 192.0.2.2 afi-safi ipv4 prefix-set out PEER-OUT-V4
+```
+
+Binding changes and edits to the referenced prefix-set are applied to
+an established session without resetting it. Inbound routes retained in
+Adj-RIB-In are replayed; outbound changes advertise newly permitted
+routes and withdraw routes that are no longer permitted. IPv6 uses the
+same configuration under `afi-safi ipv6`.
+
+Inspect a single CE peer with `show bgp vrf vrf-blue neighbor
+192.0.2.2`. The text view reports each configured family and marks an
+unresolved name explicitly:
+
+```text
+Address family: IPv4 Unicast
+  Prefix-set in:  PEER-IN-V4
+  Prefix-set out: PEER-OUT-V4 (unresolved)
+```
+
+The JSON view carries the same state in `policy_bindings`, including
+`prefix_set_in_resolved` and `prefix_set_out_resolved` booleans.

@@ -932,6 +932,11 @@ pub struct Peer {
     /// nor the collision slot come from a dead connection and are
     /// ignored at dispatch ([`resolve_conn`]).
     pub primary_conn_id: Option<ConnId>,
+    /// Monotonic generation of the currently established BGP session.
+    /// Incremented on every transition into Established so asynchronous
+    /// continuations (notably outbound-policy ownership handoffs) can never
+    /// replay a snapshot captured for a dead TCP session onto its successor.
+    pub session_generation: u64,
     /// Allocator backing [`Self::alloc_conn_id`].
     pub conn_id_next: ConnId,
     /// Parallel TCP connection awaiting RFC 4271 §6.8 resolution. Set
@@ -1023,6 +1028,12 @@ pub struct Peer {
     /// the peer is in; written by `update_group::attach` on entering
     /// Established and cleared by `detach` on leaving. Empty otherwise.
     pub update_group_id: BTreeMap<AfiSafi, super::update_group::UpdateGroupId>,
+    /// Families whose outbound policy owner is being transferred. Ordinary
+    /// soft-out and Route Refresh must not race the fence/rollback window.
+    pub output_handoff_fenced: BTreeSet<AfiSafi>,
+    /// Route Refresh requests received while the corresponding handoff fence
+    /// is active. Replayed after the new owner is installed.
+    pub pending_route_refresh: BTreeSet<AfiSafi>,
 
     /// Snapshot of `Bgp::adv_interval` captured at peer construction
     /// and refreshed by the global config callback. Read by the VPNv4
@@ -1136,6 +1147,7 @@ impl Peer {
             packet_tx: None,
             primary_role: None,
             primary_conn_id: None,
+            session_generation: 0,
             conn_id_next: 0,
             collision: None,
             cap_send: BgpCap::default(),
@@ -1169,6 +1181,8 @@ impl Peer {
             cache_evpn_timer: None,
             last_ao_installed: None,
             update_group_id: BTreeMap::new(),
+            output_handoff_fenced: BTreeSet::new(),
+            pending_route_refresh: BTreeSet::new(),
             adv_interval: timer::AdvInterval::default(),
             bfd_session_key: None,
             bfd_session_params: None,
@@ -1802,8 +1816,8 @@ fn fsm_effect(
         FsmEffect::StaleExpire(_afi_safi) => {
             stale_route_withdraw(id, bgp, peers);
         }
-        FsmEffect::RouteRefreshRecv { afi: _, safi: _ } => {
-            super::route::route_soft_out_peer(id, bgp, peers);
+        FsmEffect::RouteRefreshRecv { afi, safi } => {
+            super::route::route_refresh_peer(id, afi, safi, bgp, peers);
         }
     }
 }
@@ -1859,6 +1873,25 @@ pub fn fsm(
     // Execute side effects that need peer_map.
     fsm_effect(id, effect, bgp_ref, peer_map, shards);
 
+    // Install the egress owner before the session-up dump. The dump records
+    // every directly-sent row into the group/PET owner; attaching afterwards
+    // left that owner with an empty wire baseline, so a subsequent live deny
+    // could not withdraw routes sent during initial sync.
+    if !prev_state.is_established()
+        && peer_map
+            .get_by_idx(id)
+            .is_some_and(|peer| peer.state.is_established())
+    {
+        super::update_group::attach(
+            bgp_ref.update_groups,
+            peer_map,
+            id,
+            *bgp_ref.router_id,
+            bgp_ref.as_sets_withdraw,
+            bgp_ref.interface_addrs,
+        );
+    }
+
     // Handle state-transition consequences.
     {
         let peer = peer_map.get_mut_by_idx(id).unwrap();
@@ -1878,6 +1911,7 @@ pub fn fsm(
             ));
         }
         if !prev_state.is_established() && peer.state.is_established() {
+            peer.session_generation = peer.session_generation.wrapping_add(1).max(1);
             peer.instant = Some(Instant::now());
             // A parked cause that never fired (its Stop lost a race
             // with the session coming up) must not mislabel the next
@@ -1888,7 +1922,15 @@ pub fn fsm(
             if super::peer_egress::peer_egress_task_enabled() {
                 let ctx = peer.sync_ctx(*bgp_ref.router_id, bgp_ref.as_sets_withdraw);
                 let add_path = peer.opt.is_add_path_send(Afi::Ip, Safi::Unicast);
-                peer.pet = Some(super::peer_egress::PeerEgressTask::spawn(ctx, add_path));
+                let enhe_v6 = peer
+                    .is_enhe_v4_negotiated()
+                    .then(|| {
+                        super::update_group::compose_enhe_next_hop(peer, bgp_ref.interface_addrs)
+                    })
+                    .flatten();
+                peer.pet = Some(super::peer_egress::PeerEgressTask::spawn(
+                    ctx, add_path, enhe_v6,
+                ));
             }
             route_sync(peer, bgp_ref, shards.is_some());
         }
@@ -1903,6 +1945,8 @@ pub fn fsm(
         // clear it so the keys snapshot isn't held past the session.
         if let Some(peer) = peer_map.get_mut_by_idx(id) {
             peer.sync_v4 = None;
+            peer.output_handoff_fenced.clear();
+            peer.pending_route_refresh.clear();
             // A2 ⑥: drop the per-peer egress task (abort-on-drop) so it
             // doesn't outlive the session.
             peer.pet = None;
@@ -1912,9 +1956,9 @@ pub fn fsm(
     // Maintain update-group membership across the Established
     // boundary. Detach must run *after* route_clean so observability
     // sees the peer leave the group only once routes have been torn
-    // down; attach runs after route_sync so the group reflects the
-    // post-sync state. (The membership index flipped earlier, with
-    // the state itself.)
+    // down. Attach already ran before route_sync above so the owner can
+    // record the initial dump. (The membership index flipped earlier,
+    // with the state itself.)
     {
         let now_established = peer_map
             .get_by_idx(id)
@@ -1922,14 +1966,6 @@ pub fn fsm(
             .unwrap_or(false);
         if prev_state.is_established() && !now_established {
             super::update_group::detach(bgp_ref.update_groups, peer_map, id);
-        } else if !prev_state.is_established() && now_established {
-            super::update_group::attach(
-                bgp_ref.update_groups,
-                peer_map,
-                id,
-                *bgp_ref.router_id,
-                bgp_ref.as_sets_withdraw,
-            );
         }
         peer_map.debug_verify_membership();
     }

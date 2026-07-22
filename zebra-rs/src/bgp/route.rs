@@ -13,7 +13,7 @@ use crate::rib::tracing::fib_l2_fdb;
 use crate::rib::{self, MacAddr, api::FdbEntry};
 use crate::{bgp_adj_in_trace, bgp_adj_out_trace};
 
-use super::adj_rib::{AdjRib, Out};
+use super::adj_rib::{AdjRib, AdjRibTable, Out};
 use super::cap::CapAfiMap;
 use super::peer::{AllowAsIn, BgpTop, Event, Peer, PeerType};
 use super::peer_map::PeerMap;
@@ -4368,6 +4368,20 @@ fn fan_advertise_to_pets(prefix: Ipv4Net, selected: &[BgpRib], peers: &PeerMap) 
         let Some(pet) = peer.pet.as_ref() else {
             continue;
         };
+        // A live outbound-policy handoff has not refreshed this PET's
+        // SyncCtx yet.  Do not let a newly-selected route run through the old
+        // policy while the ownership fence is active: the handoff's ordered
+        // Refresh + full Loc-RIB replay will deliver the current winner under
+        // the new policy.  Withdraws are policy-independent and must still
+        // pass, otherwise a route that disappears during the fence could
+        // remain in the PET's Adj-RIB-Out indefinitely.
+        if new_best.is_some()
+            && peer
+                .output_handoff_fenced
+                .contains(&AfiSafi::new(Afi::Ip, Safi::Unicast))
+        {
+            continue;
+        }
         let delta = match new_best {
             Some(best) => super::peer_egress::EgressDeltaV4::Advertise {
                 prefix,
@@ -4507,7 +4521,7 @@ fn fan_addpath_to_groups(
 /// now-permitted, withdrawing the now-denied (the engine's filter-withdraw),
 /// deduping the unchanged. Ordered: the Refresh precedes the re-fan on the
 /// one channel, so the re-evaluation sees the new policy.
-fn soft_out_v4_to_pet(peer_idx: usize, bgp: &BgpTop, peers: &PeerMap) {
+fn soft_out_v4_to_pet(peer_idx: usize, bgp: &BgpTop, peers: &PeerMap, force: bool) {
     let Some(peer) = peers.get_by_idx(peer_idx) else {
         return;
     };
@@ -4515,12 +4529,17 @@ fn soft_out_v4_to_pet(peer_idx: usize, bgp: &BgpTop, peers: &PeerMap) {
         return;
     };
     let add_path = peer.opt.is_add_path_send(Afi::Ip, Safi::Unicast);
+    let enhe_v6 = peer
+        .is_enhe_v4_negotiated()
+        .then(|| super::update_group::compose_enhe_next_hop(peer, bgp.interface_addrs))
+        .flatten();
     let ctx = peer.sync_ctx(*bgp.router_id, bgp.as_sets_withdraw);
     let _ = pet
         .delta_tx
         .send(super::peer_egress::EgressDeltaV4::Refresh {
             ctx: Box::new(ctx),
             add_path,
+            enhe_v6,
         });
     let routes: Vec<(Ipv4Net, BgpRib)> = if add_path {
         bgp.shard
@@ -4538,9 +4557,12 @@ fn soft_out_v4_to_pet(peer_idx: usize, bgp: &BgpTop, peers: &PeerMap) {
             .collect()
     };
     for (prefix, rib) in routes {
-        let _ = pet
-            .delta_tx
-            .send(super::peer_egress::EgressDeltaV4::Advertise { prefix, rib });
+        let delta = if force {
+            super::peer_egress::EgressDeltaV4::Readvertise { prefix, rib }
+        } else {
+            super::peer_egress::EgressDeltaV4::Advertise { prefix, rib }
+        };
+        let _ = pet.delta_tx.send(delta);
     }
 }
 
@@ -4552,7 +4574,7 @@ fn soft_out_v4_to_pet(peer_idx: usize, bgp: &BgpTop, peers: &PeerMap) {
 /// per-peer soft-out collapses to the group: members share the egress identity,
 /// so a policy-content change is the group's, and the engine's per-prefix
 /// dedup keeps the re-send cheap for the unchanged routes.
-fn soft_out_v4_to_group(peer_idx: usize, bgp: &BgpTop, peers: &PeerMap) {
+fn soft_out_v4_to_group(peer_idx: usize, bgp: &BgpTop, peers: &PeerMap, force: bool) {
     let v4 = AfiSafi::new(Afi::Ip, Safi::Unicast);
     let Some(peer) = peers.get_by_idx(peer_idx) else {
         return;
@@ -4573,10 +4595,15 @@ fn soft_out_v4_to_group(peer_idx: usize, bgp: &BgpTop, peers: &PeerMap) {
     // Refresh every member's ctx so the re-fan builds against the new policy.
     for &ident in &group.members {
         if let Some(m) = peers.get_by_idx(ident) {
+            let enhe_v6 = m
+                .is_enhe_v4_negotiated()
+                .then(|| super::update_group::compose_enhe_next_hop(m, bgp.interface_addrs))
+                .flatten();
             task.send(super::group_egress::GroupEgressDeltaV4::AddMember {
                 ident,
                 ctx: Box::new(m.sync_ctx(*bgp.router_id, bgp.as_sets_withdraw)),
                 add_path: m.opt.is_add_path_send(Afi::Ip, Safi::Unicast),
+                enhe_v6,
             });
         }
     }
@@ -4597,7 +4624,15 @@ fn soft_out_v4_to_group(peer_idx: usize, bgp: &BgpTop, peers: &PeerMap) {
             .collect()
     };
     for (prefix, rib) in routes {
-        task.send(super::group_egress::GroupEgressDeltaV4::Advertise { prefix, rib });
+        if force {
+            task.send(super::group_egress::GroupEgressDeltaV4::Readvertise {
+                ident: peer_idx,
+                prefix,
+                rib,
+            });
+        } else {
+            task.send(super::group_egress::GroupEgressDeltaV4::Advertise { prefix, rib });
+        }
     }
 }
 
@@ -5644,7 +5679,10 @@ pub fn route_soft_out_peer(peer_idx: usize, bgp: &mut BgpTop, peers: &mut PeerMa
         if !peer.state.is_established() {
             return;
         }
-        let do_v4 = peer.is_afi_safi(Afi::Ip, Safi::Unicast);
+        let do_v4 = peer.is_afi_safi(Afi::Ip, Safi::Unicast)
+            && !peer
+                .output_handoff_fenced
+                .contains(&AfiSafi::new(Afi::Ip, Safi::Unicast));
         let do_vpn = peer.is_afi_safi(Afi::Ip, Safi::MplsVpn);
         let do_evpn = peer.is_afi_safi(Afi::L2vpn, Safi::Evpn);
         let v4vpn_rds: Vec<RouteDistinguisher> = if do_vpn {
@@ -5668,18 +5706,285 @@ pub fn route_soft_out_peer(peer_idx: usize, bgp: &mut BgpTop, peers: &mut PeerMa
 
     if do_v4 {
         if super::group_egress::egress_group_task_enabled() {
-            soft_out_v4_to_group(peer_idx, bgp, peers);
+            soft_out_v4_to_group(peer_idx, bgp, peers, false);
         } else if super::peer_egress::peer_egress_task_enabled() {
-            soft_out_v4_to_pet(peer_idx, bgp, peers);
+            soft_out_v4_to_pet(peer_idx, bgp, peers, false);
         } else {
-            route_soft_out_peer_table(peer_idx, None, bgp, peers);
+            route_soft_out_peer_table(peer_idx, None, bgp, peers, false);
         }
     }
     for rd in vpn_rds {
-        route_soft_out_peer_table(peer_idx, Some(rd), bgp, peers);
+        route_soft_out_peer_table(peer_idx, Some(rd), bgp, peers, false);
     }
     for rd in evpn_rds {
         route_soft_out_peer_table_evpn(peer_idx, rd, bgp, peers);
+    }
+}
+
+/// Answer a received ROUTE-REFRESH for exactly the requested AFI/SAFI.
+/// Unlike a live policy change, this is an explicit request to resend the
+/// current permitted Adj-RIB-Out, so byte-identical advertisements must not
+/// be deduplicated.
+pub fn route_refresh_peer(
+    peer_idx: usize,
+    afi: u16,
+    safi: u8,
+    bgp: &mut BgpTop,
+    peers: &mut PeerMap,
+) {
+    let Some(peer) = peers.get_by_idx(peer_idx) else {
+        return;
+    };
+    if !peer.state.is_established() {
+        return;
+    }
+
+    let requested_family = match (afi, safi) {
+        (1, 1) if peer.is_afi_safi(Afi::Ip, Safi::Unicast) => {
+            Some(AfiSafi::new(Afi::Ip, Safi::Unicast))
+        }
+        (2, 1) if peer.is_afi_safi(Afi::Ip6, Safi::Unicast) => {
+            Some(AfiSafi::new(Afi::Ip6, Safi::Unicast))
+        }
+        _ => None,
+    };
+    if let Some(family) = requested_family
+        && peer.output_handoff_fenced.contains(&family)
+    {
+        if let Some(peer) = peers.get_mut_by_idx(peer_idx) {
+            peer.pending_route_refresh.insert(family);
+        }
+        return;
+    }
+
+    match (afi, safi) {
+        (1, 1) if peer.is_afi_safi(Afi::Ip, Safi::Unicast) => {
+            if super::group_egress::egress_group_task_enabled() {
+                soft_out_v4_to_group(peer_idx, bgp, peers, true);
+            } else if super::peer_egress::peer_egress_task_enabled() {
+                soft_out_v4_to_pet(peer_idx, bgp, peers, true);
+            } else {
+                route_soft_out_peer_table(peer_idx, None, bgp, peers, true);
+            }
+        }
+        (2, 1) if peer.is_afi_safi(Afi::Ip6, Safi::Unicast) => {
+            route_soft_out_peer_table_v6(peer_idx, bgp, peers, true);
+        }
+        (1, 128) if peer.is_afi_safi(Afi::Ip, Safi::MplsVpn) => {
+            let rds: Vec<_> = bgp.shard.v4vpn.keys().copied().collect();
+            for rd in rds {
+                // VPNv4 has always resent every permitted route; `force`
+                // documents why this call differs from policy soft-out.
+                route_soft_out_peer_table(peer_idx, Some(rd), bgp, peers, true);
+            }
+        }
+        (25, 70) if peer.is_afi_safi(Afi::L2vpn, Safi::Evpn) => {
+            let mut rds: BTreeSet<RouteDistinguisher> =
+                bgp.local_rib.evpn.keys().copied().collect();
+            rds.extend(peer.adj_out.evpn.keys().copied());
+            for rd in rds {
+                route_soft_out_peer_table_evpn(peer_idx, rd, bgp, peers);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Per-VRF soft-in replay. Unlike the operator-facing global helper this
+/// always uses the locally saved Adj-RIB-In: a prefix-set edit must converge
+/// even when Route Refresh was not negotiated. Re-entering the normal ingest
+/// functions preserves every side effect (best path, FIB, VRF export and
+/// advertisements) while the shard keeps the original pre-policy attribute.
+pub(super) fn route_soft_in_peer_vrf(
+    peer_idx: usize,
+    afi_safi: AfiSafi,
+    bgp: &mut BgpTop,
+    peers: &mut PeerMap,
+) {
+    let Some(peer) = peers.get_by_idx(peer_idx) else {
+        return;
+    };
+    if !peer.state.is_established() {
+        return;
+    }
+    let ident = peer.ident;
+    let (v4, v6) = match bgp.shard.adj_in(ident) {
+        Some(adj) => (
+            adj.v4
+                .0
+                .iter()
+                .flat_map(|(prefix, ribs)| ribs.iter().cloned().map(|rib| (*prefix, rib)))
+                .collect::<Vec<_>>(),
+            adj.v6
+                .0
+                .iter()
+                .flat_map(|(prefix, ribs)| ribs.iter().cloned().map(|rib| (*prefix, rib)))
+                .collect::<Vec<_>>(),
+        ),
+        None => return,
+    };
+
+    if afi_safi == AfiSafi::new(Afi::Ip, Safi::Unicast) {
+        for (prefix, rib) in v4 {
+            route_ipv4_update(
+                peer_idx,
+                &Ipv4Nlri {
+                    id: rib.remote_id,
+                    prefix,
+                },
+                None,
+                rib.label,
+                &rib.attr,
+                rib.nexthop.clone(),
+                rib.enhe_egress,
+                bgp,
+                peers,
+                rib.stale,
+            );
+        }
+    }
+    if afi_safi == AfiSafi::new(Afi::Ip6, Safi::Unicast) {
+        for (prefix, rib) in v6 {
+            route_ipv6_update(
+                peer_idx,
+                &Ipv6Nlri {
+                    id: rib.remote_id,
+                    prefix,
+                },
+                None,
+                rib.label,
+                &rib.attr,
+                rib.nexthop.clone(),
+                bgp,
+                peers,
+                rib.stale,
+            );
+        }
+    }
+}
+
+/// Per-VRF soft-out for the unicast families exposed on CE peers. The v4
+/// table reuses the mature targeted diff; v6 has an equivalent targeted
+/// Adj-RIB-Out reconciliation below. Neither path touches the session FSM.
+pub(super) fn route_soft_out_peer_vrf(
+    peer_idx: usize,
+    afi_safi: AfiSafi,
+    bgp: &mut BgpTop,
+    peers: &mut PeerMap,
+) {
+    route_soft_out_peer_vrf_inner(peer_idx, afi_safi, bgp, peers, false);
+}
+
+/// Handoff reconciliation bypasses the public soft-out fence: it is the
+/// operation that installs the new owner's policy before the fence is lifted.
+pub(super) fn route_soft_out_peer_vrf_handoff(
+    peer_idx: usize,
+    afi_safi: AfiSafi,
+    bgp: &mut BgpTop,
+    peers: &mut PeerMap,
+) {
+    route_soft_out_peer_vrf_inner(peer_idx, afi_safi, bgp, peers, true);
+}
+
+fn route_soft_out_peer_vrf_inner(
+    peer_idx: usize,
+    afi_safi: AfiSafi,
+    bgp: &mut BgpTop,
+    peers: &mut PeerMap,
+    allow_fenced: bool,
+) {
+    let Some(peer) = peers.get_by_idx(peer_idx) else {
+        return;
+    };
+    if !peer.state.is_established() {
+        return;
+    }
+    if !allow_fenced && peer.output_handoff_fenced.contains(&afi_safi) {
+        return;
+    }
+    if afi_safi == AfiSafi::new(Afi::Ip, Safi::Unicast) && peer.is_afi_safi(Afi::Ip, Safi::Unicast)
+    {
+        // Keep the authoritative egress owner in the loop.  Both task
+        // engines cache the peer's SyncCtx (including the resolved
+        // prefix-set) and own their Adj-RIB-Out while their gate is on.
+        // A direct table reconciliation would update only the main-task
+        // Peer and leave that cache stale.
+        if super::group_egress::egress_group_task_enabled() {
+            soft_out_v4_to_group(peer_idx, bgp, peers, false);
+        } else if super::peer_egress::peer_egress_task_enabled() {
+            soft_out_v4_to_pet(peer_idx, bgp, peers, false);
+        } else {
+            route_soft_out_peer_table(peer_idx, None, bgp, peers, false);
+        }
+    }
+    if afi_safi == AfiSafi::new(Afi::Ip6, Safi::Unicast)
+        && peers
+            .get_by_idx(peer_idx)
+            .is_some_and(|p| p.is_afi_safi(Afi::Ip6, Safi::Unicast))
+    {
+        route_soft_out_peer_table_v6(peer_idx, bgp, peers, false);
+    }
+}
+
+/// Record a targeted soft-out result without confusing the wire path-id with
+/// Adj-RIB-Out's internal Loc-RIB identity. Non-AddPath still sends id zero,
+/// but keeps `rib.local_id` and atomically replaces the prefix's sole row.
+fn record_soft_out_adj<P: Ord + Copy>(
+    table: &mut AdjRibTable<Out, P>,
+    prefix: P,
+    rib: BgpRib,
+    add_path: bool,
+) -> bool {
+    let previous = table.0.get(&prefix).and_then(|rows| {
+        if add_path {
+            rows.iter().find(|old| old.local_id == rib.local_id)
+        } else {
+            rows.first()
+        }
+    });
+    let unchanged = previous.is_some_and(|old| old.attr == rib.attr);
+    if add_path {
+        table.add(prefix, rib);
+    } else {
+        table.0.insert(prefix, vec![rib]);
+    }
+    unchanged
+}
+
+fn remove_soft_out_adj<P: Ord>(
+    table: &mut AdjRibTable<Out, P>,
+    prefix: P,
+    id: u32,
+    add_path: bool,
+) {
+    if add_path {
+        table.remove(prefix, id);
+    } else {
+        // Also cleans the duplicate id=0 + Loc-RIB-id rows produced by the
+        // old soft-out implementation before this reconciliation runs.
+        table.0.remove(&prefix);
+    }
+}
+
+fn soft_out_v4_snapshot(
+    table: Option<&LocalRibTable<Ipv4Net>>,
+    add_path: bool,
+) -> Vec<(Ipv4Net, BgpRib)> {
+    let Some(table) = table else {
+        return Vec::new();
+    };
+    if add_path {
+        table
+            .0
+            .iter()
+            .flat_map(|(prefix, rows)| rows.iter().cloned().map(move |rib| (prefix, rib)))
+            .collect()
+    } else {
+        table
+            .1
+            .iter()
+            .map(|(prefix, rib)| (prefix, rib.clone()))
+            .collect()
     }
 }
 
@@ -5688,6 +5993,7 @@ fn route_soft_out_peer_table(
     rd: Option<RouteDistinguisher>,
     bgp: &mut BgpTop,
     peers: &mut PeerMap,
+    force: bool,
 ) {
     let (afi, safi) = if rd.is_some() {
         (Afi::Ip, Safi::MplsVpn)
@@ -5695,34 +6001,54 @@ fn route_soft_out_peer_table(
         (Afi::Ip, Safi::Unicast)
     };
 
-    // Snapshot Loc-RIB selected so the iteration outlives later
+    // Preserve the negotiated wire path-id for both IPv4 unicast and
+    // VPNv4.  Collapsing VPNv4 to the selected row here is especially
+    // harmful during Route Refresh: the peer retains the other Add-Path
+    // paths, while Adj-RIB-Out forgets them and can no longer withdraw them.
+    let add_path = peers
+        .get_by_idx(peer_idx)
+        .is_some_and(|peer| peer.opt.is_add_path_send(afi, safi));
+
+    // Add-Path advertises every Loc-RIB candidate, not just the selected
+    // best. Snapshot the appropriate view so the iteration outlives later
     // mutable borrows of `bgp` (attr_store.intern, send paths).
     let selected: Vec<(Ipv4Net, BgpRib)> = match rd {
-        Some(rd) => bgp
-            .shard
-            .v4vpn
-            .get(&rd)
-            .map(|t| t.1.iter().map(|(p, r)| (p, r.clone())).collect())
-            .unwrap_or_default(),
-        None => bgp.shard.v4.1.iter().map(|(p, r)| (p, r.clone())).collect(),
+        Some(rd) => soft_out_v4_snapshot(bgp.shard.v4vpn.get(&rd), add_path),
+        None => soft_out_v4_snapshot(Some(&bgp.shard.v4), add_path),
     };
 
     // Snapshot what's currently in this peer's Adj-RIB-Out so we can
     // detect which previously-advertised prefixes need a withdraw.
-    let was_advertised: BTreeSet<Ipv4Net> = {
+    let was_advertised: BTreeSet<(Ipv4Net, u32)> = {
         let peer = peers.get_mut_by_idx(peer_idx).expect("peer exists");
         match rd {
             Some(rd) => peer
                 .adj_out
                 .v4vpn
                 .get(&rd)
-                .map(|t| t.0.keys().copied().collect())
+                .map(|t| {
+                    t.0.iter()
+                        .flat_map(|(prefix, rows)| {
+                            rows.iter()
+                                .map(|rib| (*prefix, if add_path { rib.local_id } else { 0 }))
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
-            None => peer.adj_out.v4.0.keys().copied().collect(),
+            None => peer
+                .adj_out
+                .v4
+                .0
+                .iter()
+                .flat_map(|(prefix, rows)| {
+                    rows.iter()
+                        .map(|rib| (*prefix, if add_path { rib.local_id } else { 0 }))
+                })
+                .collect(),
         }
     };
 
-    let mut newly_advertised: BTreeSet<Ipv4Net> = BTreeSet::new();
+    let mut newly_advertised: BTreeSet<(Ipv4Net, u32)> = BTreeSet::new();
     // Soft-out targets a single peer; the per-group cache would
     // fan out to every member. Accumulate IPv4 unicast entries
     // and emit via `send_ipv4_direct` at the end so encoding
@@ -5731,8 +6057,6 @@ fn route_soft_out_peer_table(
 
     for (prefix, rib) in &selected {
         let peer = peers.get_mut_by_idx(peer_idx).expect("peer exists");
-        let add_path = peer.opt.is_add_path_send(afi, safi);
-
         // RFC 9494 §4.3: stale routes only go to LLGR peers. A
         // previously-advertised route that went stale falls out of
         // `newly_advertised` here and is withdrawn by the diff below.
@@ -5753,6 +6077,7 @@ fn route_soft_out_peer_table(
         let Some(decision) = decision else {
             continue;
         };
+        let advertised_id = nlri.id;
         let attr = decision.attr;
         if rd.is_some() && !peer.rtcv4.is_empty() && !rtc_match(&peer.rtcv4, &attr.ecom) {
             continue;
@@ -5761,7 +6086,16 @@ fn route_soft_out_peer_table(
         let attr = bgp.attr_store.intern(attr);
         let mut adj = rib.clone();
         adj.attr = attr.clone();
-        peer.adj_out.add(rd, nlri.prefix, adj);
+        let unchanged = if let Some(rd) = rd {
+            record_soft_out_adj(
+                peer.adj_out.v4vpn.entry(rd).or_default(),
+                *prefix,
+                adj,
+                add_path,
+            )
+        } else {
+            record_soft_out_adj(&mut peer.adj_out.v4, *prefix, adj, add_path)
+        };
 
         if let Some(rd_val) = rd {
             let vpnv4_nlri = Vpnv4Nlri {
@@ -5770,11 +6104,11 @@ fn route_soft_out_peer_table(
                 nlri,
             };
             peer.send_vpnv4(vpnv4_nlri, attr, true);
-        } else {
+        } else if force || !unchanged {
             ipv4_entries.push((attr, nlri));
         }
 
-        newly_advertised.insert(*prefix);
+        newly_advertised.insert((*prefix, advertised_id));
     }
 
     // Direct-emit IPv4 unicast batch (no group fan-out). When the
@@ -5797,17 +6131,17 @@ fn route_soft_out_peer_table(
         );
     }
 
-    let to_withdraw: Vec<Ipv4Net> = was_advertised
+    let to_withdraw: Vec<(Ipv4Net, u32)> = was_advertised
         .difference(&newly_advertised)
         .copied()
         .collect();
-    for prefix in to_withdraw {
+    for (prefix, id) in to_withdraw {
         let peer = peers.get_mut_by_idx(peer_idx).expect("peer exists");
         if let Some(rd) = rd {
-            peer.cache_remove_vpnv4(rd, prefix, 0);
+            peer.cache_remove_vpnv4(rd, prefix, id);
         } else {
-            // Drop any not-yet-flushed pending advert of this prefix
-            // from the shared update-group cache. The re-advert above
+            // Exclude only this peer from any not-yet-flushed pending advert
+            // in the shared update-group cache. The re-advert above
             // goes out per-peer via `send_ipv4_direct`, but a PRIOR
             // group-based advertise (`send_ipv4`, e.g. the origination
             // that ran before this peer's out-policy resolved) may have
@@ -5817,17 +6151,118 @@ fn route_soft_out_peer_table(
             // from the stale cache and re-sends the prefix this soft-out
             // just withdrew — resurrecting a route the peer's `adj_out`
             // no longer tracks, so nothing ever withdraws it again.
-            // Mirrors the group-cache cleanup in `V4Batch::withdraw`.
+            // Other members may still need the queued advertisement, so a
+            // global cache removal would create a silent route loss for them.
             let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
             if let Some(gid) = peer.update_group_id.get(&afi_safi).cloned()
                 && let Some(af) = bgp.update_groups.get_mut(&afi_safi)
                 && let Some(group) = af.group_by_id_mut(&gid)
             {
-                super::update_group::cache_remove_ipv4(group, prefix, 0);
+                super::update_group::cache_exclude_ipv4(group, prefix, id, peer_idx);
             }
         }
-        peer.adj_out.remove(rd, prefix, 0);
-        withdraw_ipv4_deferrable(bgp.update_groups, peer, rd, prefix, 0);
+        if let Some(rd) = rd {
+            remove_soft_out_adj(
+                peer.adj_out.v4vpn.entry(rd).or_default(),
+                prefix,
+                id,
+                add_path,
+            );
+        } else {
+            remove_soft_out_adj(&mut peer.adj_out.v4, prefix, id, add_path);
+        }
+        withdraw_ipv4_deferrable(bgp.update_groups, peer, rd, prefix, id);
+    }
+}
+
+/// IPv6-unicast targeted soft-out. Diff desired post-policy routes against
+/// this peer's Adj-RIB-Out, withdraw newly denied paths, advertise newly
+/// allowed/changed paths, and suppress byte-identical re-sends.
+fn route_soft_out_peer_table_v6(
+    peer_idx: usize,
+    bgp: &mut BgpTop,
+    peers: &mut PeerMap,
+    force: bool,
+) {
+    let add_path = peers
+        .get_by_idx(peer_idx)
+        .is_some_and(|p| p.opt.is_add_path_send(Afi::Ip6, Safi::Unicast));
+    let routes: Vec<(Ipv6Net, BgpRib)> = if add_path {
+        bgp.shard
+            .v6
+            .0
+            .iter()
+            .flat_map(|(prefix, rows)| rows.iter().cloned().map(move |rib| (prefix, rib)))
+            .collect()
+    } else {
+        bgp.shard
+            .v6
+            .1
+            .iter()
+            .map(|(prefix, rib)| (prefix, rib.clone()))
+            .collect()
+    };
+    let was: BTreeSet<(Ipv6Net, u32)> = peers
+        .get_by_idx(peer_idx)
+        .map(|peer| {
+            peer.adj_out
+                .v6
+                .0
+                .iter()
+                .flat_map(|(prefix, rows)| {
+                    rows.iter()
+                        .map(|rib| (*prefix, if add_path { rib.local_id } else { 0 }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut desired = BTreeSet::new();
+    let mut entries = Vec::new();
+
+    for (prefix, mut rib) in routes {
+        let peer = peers.get_mut_by_idx(peer_idx).expect("peer exists");
+        if rib.ident == peer.ident
+            || llgr_blocks_advertisement(rib.stale, &peer.cap_recv, Afi::Ip6, Safi::Unicast)
+        {
+            continue;
+        }
+        let Some((nlri, attr)) = route_update_ipv6(peer, &prefix, &rib, bgp, add_path) else {
+            continue;
+        };
+        let Some(decision) = route_apply_policy_out_v6(
+            peer,
+            AfiSafi::new(Afi::Ip6, Safi::Unicast),
+            &nlri,
+            attr,
+            rib.weight,
+        ) else {
+            continue;
+        };
+        let attr = bgp.attr_store.intern(decision.attr);
+        let id = if add_path { rib.local_id } else { 0 };
+        rib.attr = attr.clone();
+        let unchanged = record_soft_out_adj(&mut peer.adj_out.v6, prefix, rib, add_path);
+        desired.insert((prefix, id));
+        if force || !unchanged {
+            entries.push((attr, nlri));
+        }
+    }
+
+    if !entries.is_empty() {
+        let peer = peers.get_by_idx(peer_idx).expect("peer exists");
+        super::update_group::send_ipv6_direct(peer, entries);
+    }
+    for (prefix, id) in was.difference(&desired).copied().collect::<Vec<_>>() {
+        let peer = peers.get_mut_by_idx(peer_idx).expect("peer exists");
+        let afi_safi = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+        if let Some(gid) = peer.update_group_id.get(&afi_safi).cloned()
+            && let Some(af) = bgp.update_groups.get_mut(&afi_safi)
+            && let Some(group) = af.group_by_id_mut(&gid)
+        {
+            super::update_group::cache_exclude_ipv6(group, prefix, id, peer_idx);
+        }
+        withdraw_ipv6_deferrable(bgp.update_groups, peer, prefix, id);
+        remove_soft_out_adj(&mut peer.adj_out.v6, prefix, id, add_path);
     }
 }
 
@@ -11569,17 +12004,10 @@ fn withdraw_ipv6_deferrable(
 /// [`super::update_group::flush_ipv6`]); a `None` best-path emits an
 /// immediate MP_UNREACH to each member.
 ///
-/// The update-group post-policy memoization, Adj-RIB-Out tracking, and
-/// outbound policy that the v4 path carries are deferred for v6 (the
-/// policy engine is IPv4-typed). Without Adj-RIB-Out, an empty-selected
-/// withdraw is flooded to every Established v6 peer, even ones that
-/// never received the route. That is safe ONLY because the caller drops
-/// a no-op withdraw first: `route_ipv6_withdraw` returns early when it
-/// removed nothing, so a route-less peer cannot bounce the MP_UNREACH
-/// back and start an infinite withdraw storm (peers do NOT ignore an
-/// unknown-prefix withdraw — they re-evaluate and re-flood it). Never
-/// call this with an empty `selected` for a prefix that was not in the
-/// Loc-RIB.
+/// Both the plain and AddPath paths apply the peer's IPv6-unicast Output
+/// policy before recording Adj-RIB-Out.  A denied candidate therefore
+/// behaves exactly like a candidate that fell out of the Loc-RIB: only a
+/// path-id that was previously advertised is withdrawn.
 pub(super) fn route_advertise_to_peers_v6(
     prefix: Ipv6Net,
     selected: &[BgpRib],
@@ -11638,12 +12066,22 @@ pub(super) fn route_advertise_to_peers_v6(
             let Some((nlri, attr)) = route_update_ipv6(peer, &prefix, cand, bgp, true) else {
                 continue;
             };
-            let attr = bgp.attr_store.intern(attr);
+            // The incremental AddPath path must pass the same per-AFI
+            // Output gate as initial sync and the generic v6 advertise
+            // helper.  In particular, a newly learned non-match must never
+            // leak, while a permit -> deny transition must fall through to
+            // the exact path-id withdraw below.
+            let Some(decision) =
+                route_apply_policy_out_v6(peer, afi_safi, &nlri, attr, cand.weight)
+            else {
+                continue;
+            };
+            let attr = bgp.attr_store.intern(decision.attr);
             if let Some(gid) = &group_id
                 && let Some(af) = bgp.update_groups.get_mut(&afi_safi)
                 && let Some(group) = af.group_by_id_mut(gid)
             {
-                super::update_group::send_ipv6(group, nlri, attr, cand.ident, bgp.tx, true);
+                super::update_group::send_ipv6(group, nlri, attr.clone(), cand.ident, bgp.tx, true);
             } else {
                 tracing::warn!(
                     peer = %peer.address,
@@ -11652,7 +12090,9 @@ pub(super) fn route_advertise_to_peers_v6(
                 );
                 continue;
             }
-            peer.adj_out.v6.add(prefix, cand.clone());
+            let mut advertised = cand.clone();
+            advertised.attr = attr;
+            peer.adj_out.v6.add(prefix, advertised);
             newly.insert(cand.local_id);
         }
         for id in was {
@@ -13101,6 +13541,36 @@ impl Ipv4SyncCursor {
     }
 }
 
+/// Mirror a row sent directly by session-up sync into whichever asynchronous
+/// v4 owner is enabled. The row is already post-policy/post-build, so owners
+/// record it without emitting a second UPDATE.
+fn record_sync_v4_owner(peer: &Peer, bgp: &BgpTop, prefix: Ipv4Net, rib: &BgpRib) {
+    let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
+    if super::group_egress::egress_group_task_enabled()
+        && let Some(gid) = peer.update_group_id.get(&afi_safi)
+        && let Some(group) = bgp
+            .update_groups
+            .get(&afi_safi)
+            .and_then(|af| af.group_by_id(gid))
+        && let Some(task) = group.task.as_ref()
+    {
+        task.send(super::group_egress::GroupEgressDeltaV4::RecordAdjOut {
+            prefix,
+            rib: rib.clone(),
+        });
+    }
+    if super::peer_egress::peer_egress_task_enabled()
+        && let Some(task) = peer.pet.as_ref()
+    {
+        let _ = task
+            .delta_tx
+            .send(super::peer_egress::EgressDeltaV4::RecordAdjOut {
+                prefix,
+                rib: rib.clone(),
+            });
+    }
+}
+
 /// Process one chunk of the IPv4-unicast sync cursor for `peer`,
 /// returning `true` when the dump is complete (EoR sent, cursor
 /// cleared). Mirrors `route_sync_ipv4`'s per-route build but bounded to
@@ -13144,6 +13614,7 @@ pub(super) fn route_sync_v4_chunk(peer: &mut Peer, bgp: &mut BgpTop, chunk: usiz
             };
             rib.attr = bgp.attr_store.intern(decision.attr);
             let arc_attr = rib.attr.clone();
+            record_sync_v4_owner(peer, bgp, nlri.prefix, &rib);
             // Register in adj_out and dedup: if the concurrent
             // event-driven path already advertised this exact interned
             // attr, `add` returns it and we skip the resend. Interning
@@ -13175,8 +13646,6 @@ pub(super) fn route_sync_v4_chunk(peer: &mut Peer, bgp: &mut BgpTop, chunk: usiz
 
 pub fn route_sync_ipv4(peer: &mut Peer, bgp: &mut BgpTop) {
     let add_path = peer.opt.is_add_path_send(Afi::Ip, Safi::Unicast);
-    let v4_afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
-
     // Collect all routes first to avoid borrow checker issues
     let routes: Vec<(Ipv4Net, BgpRib)> = if add_path {
         bgp.shard
@@ -13217,21 +13686,7 @@ pub fn route_sync_ipv4(peer: &mut Peer, bgp: &mut BgpTop) {
         // Register to AdjOut.
         rib.attr = bgp.attr_store.intern(decision.attr);
         let arc_attr = rib.attr.clone();
-        // Group-task migration: also record the synced route into the
-        // group adj_out (without re-sending — the direct dump below delivers
-        // the bytes) so a late member that is the first of its group stays
-        // withdrawable by the group's later withdraws.
-        if super::group_egress::egress_group_task_enabled()
-            && let Some(gid) = peer.update_group_id.get(&v4_afi_safi).cloned()
-            && let Some(af) = bgp.update_groups.get(&v4_afi_safi)
-            && let Some(group) = af.group_by_id(&gid)
-            && let Some(task) = group.task.as_ref()
-        {
-            task.send(super::group_egress::GroupEgressDeltaV4::RecordAdjOut {
-                prefix: nlri.prefix,
-                rib: rib.clone(),
-            });
-        }
+        record_sync_v4_owner(peer, bgp, nlri.prefix, &rib);
         peer.adj_out.add(None, nlri.prefix, rib);
 
         entries.push((arc_attr, nlri));
@@ -17445,7 +17900,74 @@ mod policy_apply_tests {
     use ipnet::Ipv4Net;
 
     use super::*;
-    use crate::policy::{AsPathMatcher, AsPathSet, NumericMatch, PolicyList};
+    use crate::policy::prefix::set::PrefixSetEntry;
+    use crate::policy::{AsPathMatcher, AsPathSet, NumericMatch, PolicyList, PrefixSet};
+
+    fn prefix_binding(name: &str, entries: &[(&str, Option<u8>)]) -> super::super::PrefixSetValue {
+        let mut set = PrefixSet::default();
+        for (prefix, le) in entries {
+            set.insert(
+                prefix.parse().unwrap(),
+                PrefixSetEntry {
+                    le: *le,
+                    ..Default::default()
+                },
+            );
+        }
+        super::super::PrefixSetValue {
+            name: Some(name.to_string()),
+            prefix_set: Some(set),
+        }
+    }
+
+    #[test]
+    fn named_prefix_set_is_dual_stack_fail_closed_and_afi_strict() {
+        let empty_policy = super::super::PolicyListValue::default();
+        let v4 = prefix_binding(
+            "V4",
+            &[("198.51.100.0/24", None), ("203.0.113.0/24", Some(32))],
+        );
+        let v6 = prefix_binding(
+            "V6",
+            &[
+                ("2001:db8:100::/48", None),
+                ("2001:db8:200::/48", Some(128)),
+            ],
+        );
+        let apply = |binding: &super::super::PrefixSetValue, prefix: &str| {
+            super::apply_policy_net(
+                binding,
+                &empty_policy,
+                std::net::Ipv4Addr::UNSPECIFIED,
+                prefix.parse().unwrap(),
+                BgpAttr::default(),
+                0,
+            )
+        };
+
+        assert!(apply(&v4, "198.51.100.0/24").is_some(), "v4 exact");
+        assert!(apply(&v4, "203.0.113.128/25").is_some(), "v4 le");
+        assert!(apply(&v4, "100.64.0.0/24").is_none(), "v4 non-match");
+        assert!(apply(&v6, "2001:db8:100::/48").is_some(), "v6 exact");
+        assert!(apply(&v6, "2001:db8:200:1::/64").is_some(), "v6 le");
+        assert!(apply(&v6, "2001:db8:300::/48").is_none(), "v6 non-match");
+
+        // Cross-family references are an empty match set, never a silent
+        // permit. This defines both AFI-mismatch directions as fail-close.
+        assert!(apply(&v4, "2001:db8:100::/48").is_none());
+        assert!(apply(&v6, "198.51.100.0/24").is_none());
+
+        let unresolved = super::super::PrefixSetValue {
+            name: Some("MISSING".to_string()),
+            prefix_set: None,
+        };
+        assert!(apply(&unresolved, "198.51.100.0/24").is_none());
+        assert!(apply(&unresolved, "2001:db8:100::/48").is_none());
+
+        let unset = super::super::PrefixSetValue::default();
+        assert!(apply(&unset, "198.51.100.0/24").is_some());
+        assert!(apply(&unset, "2001:db8:100::/48").is_some());
+    }
 
     /// Test wrapper that preserves the legacy `Option<BgpAttr>`
     /// shape — weight defaults to 0, local_addr defaults to
@@ -18708,7 +19230,7 @@ mod tests {
         As4Path, BgpAttr, BgpNexthop, Community, CommunityValue, ExtCommunity, ExtCommunityValue,
         Ipv4Nlri, LargeCommunity, LargeCommunityValue, LocalPref,
     };
-    use ipnet::Ipv4Net;
+    use ipnet::{Ipv4Net, Ipv6Net};
 
     use crate::policy::prefix::set::PrefixSetEntry;
     use crate::policy::{
@@ -18717,6 +19239,84 @@ mod tests {
         SetCommunityConfig, SetCommunityMode, SetExtCommunityConfig, SetLargeCommunityConfig,
         SetNextHop,
     };
+
+    #[test]
+    fn non_addpath_soft_out_preserves_internal_id_and_replaces_stale_row() {
+        fn rib(local_id: u32) -> super::BgpRib {
+            let mut rib = super::BgpRib::new(
+                7,
+                Ipv4Addr::new(192, 0, 2, 1),
+                super::BgpRibType::EBGP,
+                0,
+                0,
+                &BgpAttr::default(),
+                None,
+                None,
+                false,
+            );
+            rib.local_id = local_id;
+            rib
+        }
+
+        let v4: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+        let mut table4 = super::AdjRibTable::<super::Out>::new();
+        assert!(!super::record_soft_out_adj(&mut table4, v4, rib(11), false));
+        assert!(super::record_soft_out_adj(&mut table4, v4, rib(22), false));
+        assert_eq!(table4.0[&v4].len(), 1);
+        assert_eq!(table4.0[&v4][0].local_id, 22);
+
+        // Migration safety: deny must clear every row even if an older build
+        // already left both the Loc-RIB id and the wire-id sentinel behind.
+        table4.add(v4, rib(0));
+        assert_eq!(table4.0[&v4].len(), 2);
+        super::remove_soft_out_adj(&mut table4, v4, 0, false);
+        assert!(!table4.0.contains_key(&v4));
+
+        let v6: Ipv6Net = "2001:db8::/64".parse().unwrap();
+        let mut table6 = super::AdjRibTable::<super::Out, Ipv6Net>::new();
+        super::record_soft_out_adj(&mut table6, v6, rib(31), false);
+        super::record_soft_out_adj(&mut table6, v6, rib(32), false);
+        assert_eq!(table6.0[&v6].len(), 1);
+        assert_eq!(table6.0[&v6][0].local_id, 32);
+    }
+
+    #[test]
+    fn vpnv4_addpath_soft_out_preserves_each_wire_path_id() {
+        fn rib(ident: usize, remote_id: u32) -> super::BgpRib {
+            let mut rib = super::BgpRib::new(
+                ident,
+                Ipv4Addr::new(192, 0, 2, 1),
+                super::BgpRibType::EBGP,
+                0,
+                0,
+                &BgpAttr::default(),
+                None,
+                None,
+                false,
+            );
+            rib.remote_id = remote_id;
+            rib
+        }
+
+        let prefix: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+        let mut loc_rib = super::LocalRibTable::default();
+        loc_rib.update(prefix, rib(7, 101));
+        loc_rib.update(prefix, rib(8, 202));
+        let snapshot = super::soft_out_v4_snapshot(Some(&loc_rib), true);
+        let ids: Vec<u32> = snapshot.iter().map(|(_, rib)| rib.local_id).collect();
+        assert_eq!(ids, [1, 2], "Add-Path soft-out must walk all candidates");
+
+        let mut vpn_adj = super::AdjRibTable::<super::Out>::new();
+        for (_, rib) in snapshot {
+            assert!(!super::record_soft_out_adj(&mut vpn_adj, prefix, rib, true));
+        }
+
+        let ids: Vec<u32> = vpn_adj.0[&prefix].iter().map(|rib| rib.local_id).collect();
+        assert_eq!(ids, [1, 2]);
+
+        super::remove_soft_out_adj(&mut vpn_adj, prefix, 1, true);
+        assert_eq!(vpn_adj.0[&prefix][0].local_id, 2);
+    }
 
     #[test]
     fn mup_adj_out_withdraw_roundtrip() {
@@ -21268,6 +21868,287 @@ mod v6_empty_selection_tests {
     }
 }
 
+/// Incremental IPv6-unicast AddPath egress policy regressions.  Initial
+/// session sync already evaluates the per-peer v6 Output policy; these tests
+/// pin the event-driven path to the same fail-close and path-id semantics.
+#[cfg(test)]
+mod v6_addpath_out_policy_tests {
+    use super::*;
+    use crate::bgp::peer::{Peer, State};
+    use crate::bgp::peer_map::PeerMap;
+    use crate::policy::PrefixSet;
+    use crate::policy::prefix::set::PrefixSetEntry;
+    use bgp_packet::{Afi, BgpPacket, CapMultiProtocol, Direct, ParseOption, Safi};
+
+    fn addpath_peer() -> (Peer, tokio::sync::mpsc::UnboundedReceiver<bytes::BytesMut>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        Box::leak(Box::new(rx));
+        let mut peer = Peer::new(
+            0,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 9),
+            65002,
+            "2001:db8::2".parse().unwrap(),
+            None,
+            tx,
+            crate::context::ProtoContext::default_table_no_rib(),
+        );
+        peer.state = State::Established;
+        peer.peer_type = crate::bgp::peer::PeerType::EBGP;
+        peer.param.local_addr = Some("[2001:db8::99]:179".parse().unwrap());
+
+        let family = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+        let cap = CapMultiProtocol::new(&family.afi, &family.safi);
+        let entry = peer.cap_map.entries.get_mut(&cap).unwrap();
+        entry.send = true;
+        entry.recv = true;
+        peer.opt.add_path.insert(
+            family,
+            Direct {
+                recv: false,
+                send: true,
+            },
+        );
+
+        let (packet_tx, packet_rx) = tokio::sync::mpsc::unbounded_channel();
+        peer.packet_tx = Some(packet_tx);
+        (peer, packet_rx)
+    }
+
+    fn bind_output_prefix_set(peer: &mut Peer, name: &str, allowed: &str) {
+        let mut set = PrefixSet::default();
+        set.insert(
+            allowed.parse().unwrap(),
+            PrefixSetEntry {
+                ..Default::default()
+            },
+        );
+        let slot = peer.prefix_set_slot(
+            AfiSafi::new(Afi::Ip6, Safi::Unicast),
+            super::super::InOut::Output,
+        );
+        slot.name = Some(name.to_string());
+        slot.prefix_set = Some(set);
+    }
+
+    fn candidate(prefix_nh: &str, local_id: u32) -> BgpRib {
+        let mut attr = BgpAttr::new();
+        attr.aspath = Some(As4Path::from(vec![65003]));
+        attr.nexthop = Some(BgpNexthop::Ipv6(prefix_nh.parse().unwrap()));
+        let mut rib = BgpRib::new(
+            99,
+            Ipv4Addr::new(3, 3, 3, 3),
+            BgpRibType::EBGP,
+            local_id,
+            0,
+            &attr,
+            None,
+            None,
+            false,
+        );
+        rib.local_id = local_id;
+        rib
+    }
+
+    #[tokio::test]
+    async fn incremental_addpath_new_nonmatch_is_not_advertised_or_recorded() {
+        let router_id = Ipv4Addr::new(10, 0, 0, 9);
+        let ctx = crate::context::ProtoContext::default_table_no_rib();
+        let mut peers = PeerMap::new();
+        let (mut peer, mut packet_rx) = addpath_peer();
+        bind_output_prefix_set(&mut peer, "V6-OUT", "2001:db8:100::/48");
+        let addr = peer.address;
+        peers.insert(addr, peer);
+        let ident = peers.get(&addr).unwrap().ident;
+        peers.membership_enroll(ident);
+
+        let mut local_rib = LocalRib::default();
+        let mut shard = crate::bgp::shard::BgpShard::default();
+        let mut attr_store = crate::bgp::BgpAttrStore::default();
+        let mut update_groups = crate::bgp::update_group::empty_map();
+        let interface_addrs = crate::bgp::interface_addrs::InterfaceAddrs::default();
+        crate::bgp::update_group::attach(
+            &mut update_groups,
+            &mut peers,
+            ident,
+            router_id,
+            false,
+            &interface_addrs,
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        Box::leak(Box::new(rx));
+        let prefix: Ipv6Net = "2001:db8:200::/64".parse().unwrap();
+        shard
+            .v6
+            .0
+            .entry(prefix)
+            .or_default()
+            .push(candidate("2001:db8::1", 41));
+        let mut top = BgpTop {
+            router_id: &router_id,
+            srv6_ipv6_export: None,
+            local_rib: &mut local_rib,
+            shard: &mut shard,
+            tx: &tx,
+            rib_client: &ctx.rib,
+            attr_store: &mut attr_store,
+            update_groups: &mut update_groups,
+            interface_addrs: &interface_addrs,
+            vrf_export: None,
+            color_policy: None,
+            flex_algo_routes: None,
+            flex_algo_srv6_routes: None,
+            vrf_import: None,
+            nexthop_cache: None,
+            vrf_transport_v4: None,
+            vrf_transport_v6: None,
+            central_label_alloc: None,
+            as_sets_withdraw: false,
+        };
+
+        route_advertise_to_peers_v6(prefix, &[], &mut top, &mut peers);
+
+        assert!(
+            !peers.get(&addr).unwrap().adj_out.v6.0.contains_key(&prefix),
+            "a newly learned Output prefix-set non-match must not enter Adj-RIB-Out"
+        );
+        assert!(
+            packet_rx.try_recv().is_err(),
+            "a new non-match must emit neither announce nor spurious withdraw"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_addpath_permit_to_deny_withdraws_exact_wire_path_id() {
+        let router_id = Ipv4Addr::new(10, 0, 0, 9);
+        let ctx = crate::context::ProtoContext::default_table_no_rib();
+        let mut peers = PeerMap::new();
+        let (mut peer, mut packet_rx) = addpath_peer();
+        let prefix: Ipv6Net = "2001:db8:200::/64".parse().unwrap();
+        bind_output_prefix_set(&mut peer, "V6-OUT", "2001:db8:200::/64");
+        let addr = peer.address;
+        peers.insert(addr, peer);
+        let ident = peers.get(&addr).unwrap().ident;
+        peers.membership_enroll(ident);
+
+        let mut local_rib = LocalRib::default();
+        let mut shard = crate::bgp::shard::BgpShard::default();
+        let mut attr_store = crate::bgp::BgpAttrStore::default();
+        let mut update_groups = crate::bgp::update_group::empty_map();
+        let interface_addrs = crate::bgp::interface_addrs::InterfaceAddrs::default();
+        crate::bgp::update_group::attach(
+            &mut update_groups,
+            &mut peers,
+            ident,
+            router_id,
+            false,
+            &interface_addrs,
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        Box::leak(Box::new(rx));
+        shard
+            .v6
+            .0
+            .entry(prefix)
+            .or_default()
+            .push(candidate("2001:db8::1", 73));
+
+        {
+            let mut top = BgpTop {
+                router_id: &router_id,
+                srv6_ipv6_export: None,
+                local_rib: &mut local_rib,
+                shard: &mut shard,
+                tx: &tx,
+                rib_client: &ctx.rib,
+                attr_store: &mut attr_store,
+                update_groups: &mut update_groups,
+                interface_addrs: &interface_addrs,
+                vrf_export: None,
+                color_policy: None,
+                flex_algo_routes: None,
+                flex_algo_srv6_routes: None,
+                vrf_import: None,
+                nexthop_cache: None,
+                vrf_transport_v4: None,
+                vrf_transport_v6: None,
+                central_label_alloc: None,
+                as_sets_withdraw: false,
+            };
+            route_advertise_to_peers_v6(prefix, &[], &mut top, &mut peers);
+        }
+        assert_eq!(
+            peers.get(&addr).unwrap().adj_out.v6.0[&prefix][0].local_id,
+            73,
+            "the permitted AddPath row must retain its wire path-id"
+        );
+
+        // Same binding name, new body: the prefix is no longer permitted.
+        // This models the live body-change fan-out without resetting the
+        // session or changing the update-group signature.
+        bind_output_prefix_set(
+            peers.get_mut(&addr).unwrap(),
+            "V6-OUT",
+            "2001:db8:ffff::/64",
+        );
+        {
+            let mut top = BgpTop {
+                router_id: &router_id,
+                srv6_ipv6_export: None,
+                local_rib: &mut local_rib,
+                shard: &mut shard,
+                tx: &tx,
+                rib_client: &ctx.rib,
+                attr_store: &mut attr_store,
+                update_groups: &mut update_groups,
+                interface_addrs: &interface_addrs,
+                vrf_export: None,
+                color_policy: None,
+                flex_algo_routes: None,
+                flex_algo_srv6_routes: None,
+                vrf_import: None,
+                nexthop_cache: None,
+                vrf_transport_v4: None,
+                vrf_transport_v6: None,
+                central_label_alloc: None,
+                as_sets_withdraw: false,
+            };
+            route_advertise_to_peers_v6(prefix, &[], &mut top, &mut peers);
+        }
+
+        assert!(
+            !peers.get(&addr).unwrap().adj_out.v6.0.contains_key(&prefix),
+            "the denied path-id must be removed from Adj-RIB-Out"
+        );
+        let bytes = packet_rx.try_recv().expect("permit -> deny must withdraw");
+        let mut parse_opt = ParseOption::default();
+        parse_opt.add_path.insert(
+            AfiSafi::new(Afi::Ip6, Safi::Unicast),
+            Direct {
+                recv: true,
+                send: false,
+            },
+        );
+        let (_, packet) = BgpPacket::parse_packet(&bytes, true, Some(parse_opt)).unwrap();
+        let BgpPacket::Update(update) = packet else {
+            panic!("expected UPDATE");
+        };
+        let Some(MpUnreachAttr::Ipv6Nlri(withdrawn)) = update.mp_withdraw else {
+            panic!("expected IPv6 MP_UNREACH");
+        };
+        assert_eq!(withdrawn.len(), 1);
+        assert_eq!(withdrawn[0].prefix, prefix);
+        assert_eq!(
+            withdrawn[0].id, 73,
+            "withdraw must carry the exact path-id, never id 0"
+        );
+        assert!(
+            packet_rx.try_recv().is_err(),
+            "withdraw must not be duplicated"
+        );
+    }
+}
+
 #[cfg(test)]
 mod srv6_sid_family_tests {
     use super::*;
@@ -21527,6 +22408,200 @@ mod labeled_community_suppress_tests {
             central_label_alloc: None,
             as_sets_withdraw: false,
         }
+    }
+
+    #[test]
+    fn route_refresh_queues_v4_and_v6_while_output_handoff_is_fenced() {
+        let router_id = Ipv4Addr::new(10, 0, 0, 9);
+        let ctx = crate::context::ProtoContext::default_table_no_rib();
+        let mut local_rib = LocalRib::default();
+        let mut shard = crate::bgp::shard::BgpShard::default();
+        let mut attr_store = crate::bgp::BgpAttrStore::default();
+        let mut update_groups = crate::bgp::update_group::empty_map();
+        let interface_addrs = crate::bgp::interface_addrs::InterfaceAddrs::default();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        Box::leak(Box::new(rx));
+
+        let mut peer = ebgp_peer();
+        for family in [
+            AfiSafi::new(Afi::Ip, Safi::Unicast),
+            AfiSafi::new(Afi::Ip6, Safi::Unicast),
+        ] {
+            let cap = CapMultiProtocol::new(&family.afi, &family.safi);
+            let entry = peer.cap_map.entries.get_mut(&cap).unwrap();
+            entry.send = true;
+            entry.recv = true;
+            peer.output_handoff_fenced.insert(family);
+        }
+        let addr = peer.address;
+        let mut peers = PeerMap::new();
+        peers.insert(addr, peer);
+        let peer_idx = peers.get(&addr).unwrap().ident;
+        let mut top = empty_top(
+            &router_id,
+            &mut local_rib,
+            &mut shard,
+            &mut attr_store,
+            &mut update_groups,
+            &interface_addrs,
+            &ctx.rib,
+            &tx,
+        );
+
+        route_refresh_peer(peer_idx, 1, 1, &mut top, &mut peers);
+        route_refresh_peer(peer_idx, 2, 1, &mut top, &mut peers);
+
+        let peer = peers.get_by_idx(peer_idx).unwrap();
+        assert_eq!(peer.pending_route_refresh, peer.output_handoff_fenced);
+    }
+
+    #[tokio::test]
+    async fn pet_handoff_does_not_advertise_with_old_policy_before_replay() {
+        let router_id = Ipv4Addr::new(10, 0, 0, 9);
+        let ctx = crate::context::ProtoContext::default_table_no_rib();
+        let mut local_rib = LocalRib::default();
+        let mut shard = crate::bgp::shard::BgpShard::default();
+        let mut attr_store = crate::bgp::BgpAttrStore::default();
+        let mut update_groups = crate::bgp::update_group::empty_map();
+        let interface_addrs = crate::bgp::interface_addrs::InterfaceAddrs::default();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        Box::leak(Box::new(rx));
+
+        let family = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let mut peer = ebgp_peer();
+        let cap = CapMultiProtocol::new(&family.afi, &family.safi);
+        let entry = peer.cap_map.entries.get_mut(&cap).unwrap();
+        entry.send = true;
+        entry.recv = true;
+        let (packet_tx, mut packet_rx) = tokio::sync::mpsc::unbounded_channel();
+        peer.packet_tx = Some(packet_tx);
+        let addr = peer.address;
+        let mut peers = PeerMap::new();
+        peers.insert(addr, peer);
+        let peer_idx = peers.get(&addr).unwrap().ident;
+        peers.membership_enroll(peer_idx);
+        {
+            let peer = peers.get_mut_by_idx(peer_idx).unwrap();
+            peer.pet = Some(crate::bgp::peer_egress::PeerEgressTask::spawn(
+                peer.sync_ctx(router_id, false),
+                false,
+                None,
+            ));
+        }
+
+        let route = |nexthop: Ipv4Addr| {
+            let mut attr = BgpAttr::new();
+            attr.aspath = Some(As4Path::from(vec![65003]));
+            attr.nexthop = Some(BgpNexthop::Ipv4(nexthop));
+            BgpRib::new(
+                99,
+                Ipv4Addr::new(3, 3, 3, 3),
+                BgpRibType::EBGP,
+                0,
+                0,
+                &attr,
+                None,
+                None,
+                false,
+            )
+        };
+        let old_prefix: Ipv4Net = "10.90.0.0/24".parse().unwrap();
+        let racing_prefix: Ipv4Net = "10.91.0.0/24".parse().unwrap();
+        let old_route = route(Ipv4Addr::new(192, 0, 2, 90));
+        let racing_route = route(Ipv4Addr::new(192, 0, 2, 91));
+        shard
+            .v4
+            .0
+            .entry(old_prefix)
+            .or_default()
+            .push(old_route.clone());
+        shard.v4.1.insert(old_prefix, old_route.clone());
+
+        // Establish a real old-policy PET baseline, then drain its packet.
+        fan_advertise_to_pets(old_prefix, &[old_route], &peers);
+        let (reply, done) = tokio::sync::oneshot::channel();
+        peers
+            .get_by_idx(peer_idx)
+            .unwrap()
+            .pet
+            .as_ref()
+            .unwrap()
+            .delta_tx
+            .send(crate::bgp::peer_egress::EgressDeltaV4::DumpAdjOut { reply })
+            .unwrap();
+        assert_eq!(done.await.unwrap().len(), 1);
+        assert!(packet_rx.try_recv().is_ok());
+        while packet_rx.try_recv().is_ok() {}
+
+        // The policy commit has begun but the PET still owns the old
+        // permit-all SyncCtx. A concurrently learned route must not reach it.
+        peers
+            .get_mut_by_idx(peer_idx)
+            .unwrap()
+            .output_handoff_fenced
+            .insert(family);
+        shard
+            .v4
+            .0
+            .entry(racing_prefix)
+            .or_default()
+            .push(racing_route.clone());
+        shard.v4.1.insert(racing_prefix, racing_route.clone());
+        fan_advertise_to_pets(racing_prefix, &[racing_route], &peers);
+        let (reply, done) = tokio::sync::oneshot::channel();
+        peers
+            .get_by_idx(peer_idx)
+            .unwrap()
+            .pet
+            .as_ref()
+            .unwrap()
+            .delta_tx
+            .send(crate::bgp::peer_egress::EgressDeltaV4::DumpAdjOut { reply })
+            .unwrap();
+        let during_fence = done.await.unwrap();
+        assert_eq!(during_fence.len(), 1);
+        assert_eq!(during_fence[0].0, old_prefix);
+        assert!(packet_rx.try_recv().is_err(), "old policy leaked a route");
+
+        // Install deny-all and run the same ordered Refresh + full replay as
+        // the handoff continuation. It withdraws the old baseline while the
+        // racing route remains absent throughout.
+        {
+            let peer = peers.get_mut_by_idx(peer_idx).unwrap();
+            let slot = peer.prefix_set_slot(family, super::super::InOut::Output);
+            slot.name = Some("DENY-ALL".to_string());
+            slot.prefix_set = Some(crate::policy::PrefixSet::default());
+            peer.rebuild_out_policy();
+        }
+        let top = empty_top(
+            &router_id,
+            &mut local_rib,
+            &mut shard,
+            &mut attr_store,
+            &mut update_groups,
+            &interface_addrs,
+            &ctx.rib,
+            &tx,
+        );
+        soft_out_v4_to_pet(peer_idx, &top, &peers, false);
+        let (reply, done) = tokio::sync::oneshot::channel();
+        peers
+            .get_by_idx(peer_idx)
+            .unwrap()
+            .pet
+            .as_ref()
+            .unwrap()
+            .delta_tx
+            .send(crate::bgp::peer_egress::EgressDeltaV4::DumpAdjOut { reply })
+            .unwrap();
+        assert!(done.await.unwrap().is_empty());
+        peers
+            .get_mut_by_idx(peer_idx)
+            .unwrap()
+            .output_handoff_fenced
+            .remove(&family);
+        assert!(packet_rx.try_recv().is_ok(), "old route was not withdrawn");
+        assert!(packet_rx.try_recv().is_err(), "racing route was advertised");
     }
 
     /// Review finding #14: a labeled-unicast (SAFI 4) route carrying

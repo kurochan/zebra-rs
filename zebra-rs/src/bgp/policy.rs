@@ -1,6 +1,6 @@
 use crate::policy::{PolicyList, PrefixSet};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InOut {
     Input,
     Output,

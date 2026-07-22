@@ -1,0 +1,32 @@
+interface:
+- if-name: router
+  ipv4:
+    address: 192.0.2.2/30
+  ipv6:
+    address: 2001:db8:12::2/64
+router:
+  bgp:
+    global:
+      as: 65002
+      router-id: 192.0.2.2
+    neighbor:
+    - remote-address: 192.0.2.1
+      remote-as: 65001
+      timers: {connect-retry-time: 3}
+      enabled: true
+      afi-safi:
+      - name: ipv4
+        enabled: true
+      - name: ipv6
+        enabled: true
+    afi-safi:
+    - name: ipv4
+      network:
+      - prefix: 198.51.100.0/24
+      - prefix: 203.0.113.128/25
+      - prefix: 100.64.0.0/24
+    - name: ipv6
+      network:
+      - prefix: 2001:db8:100::/48
+      - prefix: 2001:db8:200:1::/64
+      - prefix: 2001:db8:300::/48

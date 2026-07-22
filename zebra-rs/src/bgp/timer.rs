@@ -9,7 +9,7 @@ use crate::context::Timer;
 use super::peer::{Event, Peer, PeerType, State};
 use super::{Bgp, Message};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Config {
     pub idle_hold_time: Option<u16>,
     pub delay_open_time: Option<u16>,

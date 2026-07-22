@@ -254,9 +254,12 @@ module zebra-bgp-vrf {
         description
           "Per-address-family activation for this CE peer — the
            equivalent of IOS-XR `address-family <af> ... neighbor X
-           activate`. An entry with `enabled true` adds the family to
-           the Multiprotocol capability set advertised in the OPEN;
-           `enabled false` removes it. Only the IPv4 and IPv6 unicast
+           activate`. The optional `enabled` leaf is an explicit
+           capability opinion: `true` adds the family to the
+           Multiprotocol capability set advertised in the OPEN and
+           `false` removes it. A list entry may instead contain only
+           `prefix-set` bindings; that policy-only form does not change
+           the negotiated family set. Only the IPv4 and IPv6 unicast
            families apply to a PE-CE session (VPNv4 / VPNv6 / EVPN stay
            anchored on the top-level / global neighbor list).
 
@@ -267,15 +270,32 @@ module zebra-bgp-vrf {
            explicit knob is only required to override that, e.g. to
            additionally carry IPv4 unicast over an IPv6 session. Unlike
            the global neighbor, IPv4 unicast is NOT forced on for an
-           IPv6 peer. A change takes effect when the session next
-           renegotiates capabilities (`clear bgp`).";
+           IPv6 peer. A change to the effective capability set
+           re-materializes the affected VRF session; a policy-only
+           `prefix-set` change does not.";
         uses zas:afi-safi-unicast;
         leaf enabled {
           ext:help "Enable this address family for the CE peer";
           type boolean;
-          mandatory true;
           description
-            "Whether this AFI,SAFI is enabled for the CE peer.";
+            "Optional explicit activation override for this AFI,SAFI.
+             Absence leaves address-derived and peer-group activation
+             unchanged, allowing a prefix-set-only list entry.";
+        }
+        container prefix-set {
+          ext:help "Per-family prefix-set references";
+          description
+            "Per-direction prefix-set references applied to routes of this
+             address family. A configured reference that does not resolve to
+             an existing prefix-set is fail-closed.";
+          leaf in {
+            ext:help "Inbound prefix-set filter for this family";
+            type string;
+          }
+          leaf out {
+            ext:help "Outbound prefix-set filter for this family";
+            type string;
+          }
         }
       }
     }

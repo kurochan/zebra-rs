@@ -1,0 +1,71 @@
+vrf:
+- name: iso-blue
+- name: iso-red
+interface:
+- if-name: iso-default
+  ipv4:
+    address: 192.0.2.9/30
+- if-name: iso-blue
+  vrf: iso-blue
+  ipv4:
+    address: 192.0.2.13/30
+- if-name: iso-red
+  vrf: iso-red
+  ipv4:
+    address: 192.0.2.17/30
+prefix-set:
+- name: SHARED-IN
+  prefixes:
+  - prefix: 10.20.0.0/24
+  - prefix: 10.30.0.0/24
+- name: BLUE-OUT
+  prefixes:
+  - prefix: 10.21.0.0/24
+- name: RED-OUT
+  prefixes:
+  - prefix: 10.31.0.0/24
+router:
+  bgp:
+    global:
+      as: 65001
+      router-id: 192.0.2.9
+    neighbor:
+    - remote-address: 192.0.2.10
+      remote-as: 65100
+      enabled: true
+      afi-safi:
+      - name: ipv4
+        enabled: true
+    vrf:
+    - name: iso-blue
+      rd: 65001:200
+      afi-safi:
+        ipv4:
+          network:
+          - prefix: 10.21.0.0/24
+          - prefix: 10.21.99.0/24
+      neighbor:
+      - remote-address: 192.0.2.14
+        remote-as: 65101
+        afi-safi:
+        - name: ipv4
+          enabled: true
+          prefix-set:
+            in: SHARED-IN
+            out: BLUE-OUT
+    - name: iso-red
+      rd: 65001:300
+      afi-safi:
+        ipv4:
+          network:
+          - prefix: 10.31.0.0/24
+          - prefix: 10.31.99.0/24
+      neighbor:
+      - remote-address: 192.0.2.18
+        remote-as: 65102
+        afi-safi:
+        - name: ipv4
+          enabled: true
+          prefix-set:
+            in: SHARED-IN
+            out: RED-OUT

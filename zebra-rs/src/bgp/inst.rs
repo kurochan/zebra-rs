@@ -909,14 +909,18 @@ pub struct Bgp {
     pub vrfs: BTreeMap<String, super::vrf_config::BgpVrfConfig>,
     /// Candidate snapshot captured at `CommitStart`. At `CommitEnd`, an
     /// existing VRF whose spawn-time structure differs is safely despawned
-    /// and spawned again.
+    /// and spawned again; prefix-set-only edits stay on their live path.
     pub(crate) vrf_commit_baseline: BTreeMap<String, super::vrf_config::BgpVrfConfig>,
     /// Neighbor-group snapshot paired with `vrf_commit_baseline`. Per-VRF
     /// peers resolve group remote-AS and AFI/SAFI opinions at spawn time, so
-    /// the structural diff must compare effective values from both sides of
-    /// the transaction.
+    /// the structural diff must compare the effective values from both sides
+    /// of the transaction.
     pub(crate) vrf_neighbor_group_commit_baseline:
         BTreeMap<String, super::neighbor_group::NeighborGroup>,
+    /// First-observed per-VRF prefix-set bindings changed by the current
+    /// config transaction. Drained at `CommitEnd`, so a leaf replacement's
+    /// Delete+Set callbacks are delivered atomically to the running VRF.
+    pub(crate) vrf_prefix_set_pending: Vec<super::vrf_config::PendingVrfPrefixSetChange>,
     /// Per-VRF tasks currently running. The diff against
     /// [`Self::vrfs`] at `CommitEnd` spawns the names that show up
     /// in the desired set but not here, and despawns names that
@@ -1230,6 +1234,7 @@ impl Bgp {
             vrfs: BTreeMap::new(),
             vrf_commit_baseline: BTreeMap::new(),
             vrf_neighbor_group_commit_baseline: BTreeMap::new(),
+            vrf_prefix_set_pending: Vec::new(),
             vrf_registry: BTreeMap::new(),
             rib_known_vrfs: BTreeMap::new(),
             rib_subscriber,
@@ -1848,6 +1853,7 @@ impl Bgp {
             &self.rib_subscriber,
             srv6,
             self.tracing.clone(),
+            self.policy_tx.clone(),
             self.vrf_global_tx.clone(),
         );
         self.register_vrf_show(name, &new_handle);
@@ -2493,9 +2499,9 @@ impl Bgp {
             self.router_id,
             self.asn,
         );
-        // Reuse the full teardown/spawn path: it unregisters the old show
-        // client, purges exports before label reuse, clears peer_index, then
-        // registers fresh peers/show routing from final config.
+        // Reuse the full teardown/spawn path: it unregisters the old show and
+        // policy clients, purges exports before label reuse, clears peer_index,
+        // then registers fresh watches/peers/show routing from final config.
         to_despawn.extend(to_respawn.iter().cloned());
         to_spawn.extend(to_respawn);
 
@@ -2585,6 +2591,7 @@ impl Bgp {
                 &self.rib_subscriber,
                 srv6,
                 self.tracing.clone(),
+                self.policy_tx.clone(),
                 self.vrf_global_tx.clone(),
             );
             self.register_vrf_show(&name, &handle);
@@ -2940,6 +2947,7 @@ impl Bgp {
             &self.rib_subscriber,
             srv6,
             self.tracing.clone(),
+            self.policy_tx.clone(),
             self.vrf_global_tx.clone(),
         );
         self.register_vrf_show(name, &new_handle);
@@ -2958,6 +2966,9 @@ impl Bgp {
     pub fn process_cm_msg(&mut self, msg: ConfigRequest) {
         match msg.op {
             ConfigOp::CommitStart => {
+                // Do not let an aborted/incomplete prior transaction leak
+                // prefix-set changes into this commit.
+                self.vrf_prefix_set_pending.clear();
                 self.vrf_commit_baseline.clone_from(&self.vrfs);
                 self.vrf_neighbor_group_commit_baseline
                     .clone_from(&self.neighbor_groups);
@@ -2980,9 +2991,11 @@ impl Bgp {
                 // `self.vrfs` (desired) against `self.vrf_registry`
                 // (running), spawn the additions, despawn the
                 // removals. Spawn-time structural edits to an existing VRF
-                // use the same full teardown/spawn path.
+                // use the same full teardown/spawn path; prefix-set-only edits
+                // are delivered atomically through the live inbox afterwards.
                 super::vrf_config::log_commit_diff(self);
                 self.apply_vrf_commit_diff();
+                super::vrf_config::apply_prefix_set_commit_changes(self, msg.commit_generation);
                 self.vrf_commit_baseline.clear();
                 self.vrf_neighbor_group_commit_baseline.clear();
                 self.apply_mup_c_commit_diff();
@@ -4251,6 +4264,7 @@ impl Bgp {
             &self.rib_subscriber,
             srv6,
             self.tracing.clone(),
+            self.policy_tx.clone(),
             self.vrf_global_tx.clone(),
         );
         self.register_vrf_show(name, &new_handle);
@@ -5127,7 +5141,10 @@ impl Bgp {
         // step a prefix-set / policy-list edit only affects routes
         // that arrive *after* the edit.
         match msg {
+            policy::PolicyRx::PrefixSetCommitStart { .. }
+            | policy::PolicyRx::PrefixSetInventory { .. } => {}
             policy::PolicyRx::PrefixSet {
+                generation: _,
                 name: _,
                 ident,
                 policy_type,

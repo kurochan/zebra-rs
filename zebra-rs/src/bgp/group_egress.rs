@@ -19,10 +19,10 @@
 //! gate-on egress is unchanged; the engine is exercised by the unit tests.
 //! Default off; gate-off is byte-identical.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
-use bgp_packet::{Ipv4Nlri, UpdatePacket};
+use bgp_packet::{Ipv4MpReachNextHop, Ipv4Nlri, UpdatePacket};
 use bytes::BytesMut;
 use ipnet::Ipv4Net;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -58,13 +58,51 @@ pub enum GroupEgressDeltaV4 {
         ident: usize,
         ctx: Box<SyncCtx>,
         add_path: bool,
+        enhe_v6: Option<Ipv4MpReachNextHop>,
     },
     RemoveMember {
         ident: usize,
     },
+    /// Fence a member off this owner and return exactly the rows that could
+    /// have reached it.  FIFO processing is the fence: every earlier delta
+    /// has finished enqueueing its packets before the reply is sent, and the
+    /// member is removed before any later delta is handled.
+    ExtractMember {
+        ident: usize,
+        reply: tokio::sync::oneshot::Sender<Vec<(Ipv4Net, BgpRib)>>,
+    },
+    /// Start an ownership handoff without making the member a fan-out target.
+    /// `previous` is the snapshot returned by `ExtractMember` on the old
+    /// owner.  The caller may now replay the Loc-RIB into this task; deltas
+    /// update the shared Adj-RIB-Out while deliberately skipping this pending
+    /// member.
+    BeginMemberHandoff {
+        ident: usize,
+        ctx: Box<SyncCtx>,
+        add_path: bool,
+        enhe_v6: Option<Ipv4MpReachNextHop>,
+        previous: Vec<(Ipv4Net, BgpRib)>,
+    },
+    /// Reconcile the pending member against this owner's now-current
+    /// Adj-RIB-Out, then atomically promote it into the fan-out member set.
+    FinishMemberHandoff {
+        ident: usize,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    CountMembers {
+        reply: tokio::sync::oneshot::Sender<usize>,
+    },
     /// The new best path for `prefix`. The split-horizon source is the path's
     /// own origin (`rib.ident`), derived in the engine — no separate field.
     Advertise {
+        prefix: Ipv4Net,
+        rib: BgpRib,
+    },
+    /// Force one member's current route to be sent again in response to that
+    /// member's ROUTE-REFRESH. Other members are deliberately not fanned to.
+    Readvertise {
+        ident: usize,
         prefix: Ipv4Net,
         rib: BgpRib,
     },
@@ -169,6 +207,15 @@ impl GroupEgressTask {
     pub fn delta_tx(&self) -> UnboundedSender<GroupEgressDeltaV4> {
         self.delta_tx.clone()
     }
+
+    pub fn extract_member(
+        &self,
+        ident: usize,
+    ) -> tokio::sync::oneshot::Receiver<Vec<(Ipv4Net, BgpRib)>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.send(GroupEgressDeltaV4::ExtractMember { ident, reply });
+        rx
+    }
 }
 
 /// A group's owned v4-unicast egress state + per-delta logic, run inside the
@@ -181,10 +228,31 @@ struct Engine {
     /// Member peer → its `SyncCtx` (the packet sink; the egress-transform
     /// fields are shared across the group, so any member's ctx builds the
     /// canonical bytes).
-    members: BTreeMap<usize, SyncCtx>,
+    members: BTreeMap<usize, Member>,
+    /// Members being transferred from another owner. They may supply a build
+    /// context to an otherwise-empty new group, but are not fan-out targets
+    /// until `FinishMemberHandoff` has reconciled their old wire state.
+    pending_members: BTreeMap<usize, PendingMember>,
+    /// Members extracted from this owner. A queued soft-out or Route Refresh
+    /// may still deliver `AddMember` after `ExtractMember`; reject it until
+    /// the old lifecycle explicitly removes the member or a new owner begins
+    /// the handoff.
+    extracted_members: BTreeSet<usize>,
     add_path: bool,
     adj_out: AdjRibTable<Out>,
     attr_store: BgpAttrStore,
+}
+
+struct PendingMember {
+    ctx: SyncCtx,
+    add_path: bool,
+    enhe_v6: Option<Ipv4MpReachNextHop>,
+    previous: Vec<(Ipv4Net, BgpRib)>,
+}
+
+struct Member {
+    ctx: SyncCtx,
+    enhe_v6: Option<Ipv4MpReachNextHop>,
 }
 
 impl Engine {
@@ -194,14 +262,64 @@ impl Engine {
                 ident,
                 ctx,
                 add_path,
+                enhe_v6,
             } => {
                 self.add_path = add_path;
-                self.members.insert(ident, *ctx);
+                if let Some(pending) = self.pending_members.get_mut(&ident) {
+                    // A whole-group soft-out refreshes every member's SyncCtx.
+                    // Keep a handoff target pending while accepting that fresh
+                    // context; otherwise the replay would expose it to fan-out
+                    // before Finish has diffed the old owner's wire state.
+                    pending.ctx = *ctx;
+                    pending.add_path = add_path;
+                    pending.enhe_v6 = enhe_v6;
+                } else if !self.extracted_members.contains(&ident) {
+                    self.members.insert(ident, Member { ctx: *ctx, enhe_v6 });
+                }
             }
             GroupEgressDeltaV4::RemoveMember { ident } => {
                 self.members.remove(&ident);
+                self.pending_members.remove(&ident);
+                self.extracted_members.remove(&ident);
+            }
+            GroupEgressDeltaV4::ExtractMember { ident, reply } => {
+                let rows = self.member_rows(ident);
+                self.members.remove(&ident);
+                self.pending_members.remove(&ident);
+                self.extracted_members.insert(ident);
+                let _ = reply.send(rows);
+            }
+            GroupEgressDeltaV4::BeginMemberHandoff {
+                ident,
+                ctx,
+                add_path,
+                enhe_v6,
+                previous,
+            } => {
+                self.members.remove(&ident);
+                self.extracted_members.remove(&ident);
+                self.pending_members.insert(
+                    ident,
+                    PendingMember {
+                        ctx: *ctx,
+                        add_path,
+                        enhe_v6,
+                        previous,
+                    },
+                );
+            }
+            GroupEgressDeltaV4::FinishMemberHandoff { ident, reply } => {
+                self.finish_member_handoff(ident);
+                let _ = reply.send(());
+            }
+            #[cfg(test)]
+            GroupEgressDeltaV4::CountMembers { reply } => {
+                let _ = reply.send(self.members.len());
             }
             GroupEgressDeltaV4::Advertise { prefix, rib } => self.advertise(prefix, rib),
+            GroupEgressDeltaV4::Readvertise { ident, prefix, rib } => {
+                self.readvertise(ident, prefix, rib)
+            }
             GroupEgressDeltaV4::RecordAdjOut { prefix, rib } => self.record_adj_out(prefix, rib),
             GroupEgressDeltaV4::Withdraw {
                 prefix,
@@ -255,12 +373,15 @@ impl Engine {
         let Some(ctx) = self
             .members
             .iter()
+            .map(|(id, member)| (id, &member.ctx))
+            .chain(self.pending_members.iter().map(|(id, p)| (id, &p.ctx)))
             .find(|(id, _)| **id != source)
             .map(|(_, c)| c.clone())
         else {
             // Nobody is eligible to receive this route. Do not create a
-            // phantom Adj-RIB-Out row: a later session join receives the
-            // current Loc-RIB through its direct initial dump.
+            // phantom Adj-RIB-Out row: a later session join gets the current
+            // Loc-RIB through its direct initial dump, and a handoff replays
+            // Loc-RIB explicitly before promotion.
             return;
         };
         let built = super::route::route_update_ipv4(&ctx, &prefix, &rib, self.add_path).and_then(
@@ -278,9 +399,37 @@ impl Engine {
         let prev = self.adj_out.record_out(prefix, rib, self.add_path);
         let already_sent = prev.is_some_and(|p| Arc::ptr_eq(&p.attr, &arc));
         if !already_sent {
-            let bytes_list =
-                encode_ipv4_update(&arc, &[nlri], ctx.max_packet_size(), ctx.as4, None);
-            self.fan(&bytes_list, source);
+            self.fan_advertise(&arc, nlri, source);
+        }
+    }
+
+    /// ROUTE-REFRESH is per session. Rebuild with that member's current
+    /// context and bypass Adj-RIB-Out dedup, while retaining split-horizon.
+    fn readvertise(&mut self, ident: usize, prefix: Ipv4Net, mut rib: BgpRib) {
+        let Some(member) = self.members.get(&ident) else {
+            return;
+        };
+        let ctx = member.ctx.clone();
+        let enhe_v6 = member.enhe_v6;
+        if rib.ident == ident {
+            return;
+        }
+        let Some((nlri, decision)) =
+            super::route::route_update_ipv4(&ctx, &prefix, &rib, self.add_path).and_then(
+                |(nlri, attr)| {
+                    super::route::route_apply_policy_out(&ctx, &nlri, attr, rib.weight)
+                        .map(|d| (nlri, d))
+                },
+            )
+        else {
+            return;
+        };
+        let arc = self.attr_store.intern(decision.attr);
+        rib.attr = arc.clone();
+        self.adj_out.add(prefix, rib);
+        let bytes_list = encode_ipv4_update(&arc, &[nlri], ctx.max_packet_size(), ctx.as4, enhe_v6);
+        for buf in bytes_list {
+            ctx.send_packet(buf);
         }
     }
 
@@ -310,7 +459,7 @@ impl Engine {
                 .members
                 .values()
                 .next()
-                .map(|c| c.max_packet_size())
+                .map(|m| m.ctx.max_packet_size())
                 .unwrap_or(4096);
             let mut update = UpdatePacket::with_max_packet_size(max);
             update.ipv4_withdraw.push(Ipv4Nlri { id, prefix });
@@ -328,14 +477,105 @@ impl Engine {
     /// The encode happened once; this is a cheap per-member buffer clone +
     /// enqueue (the per-member backpressure rides each ctx's `send_packet`).
     fn fan(&self, bytes_list: &[BytesMut], source_ident: usize) {
-        for (ident, ctx) in &self.members {
+        for (ident, member) in &self.members {
             if *ident == source_ident {
                 continue;
             }
             for buf in bytes_list {
-                ctx.send_packet(buf.clone());
+                member.ctx.send_packet(buf.clone());
             }
         }
+    }
+
+    /// ENHE next-hops are per peer/interface, not part of the shared route
+    /// transform. Encode with each member's composed next-hop while retaining
+    /// the group's shared policy/attribute computation.
+    fn fan_advertise(&self, attr: &Arc<bgp_packet::BgpAttr>, nlri: Ipv4Nlri, source: usize) {
+        for (ident, member) in &self.members {
+            if *ident == source {
+                continue;
+            }
+            for bytes in encode_ipv4_update(
+                attr,
+                std::slice::from_ref(&nlri),
+                member.ctx.max_packet_size(),
+                member.ctx.as4,
+                member.enhe_v6,
+            ) {
+                member.ctx.send_packet(bytes);
+            }
+        }
+    }
+
+    /// Snapshot the post-policy rows a particular member can have on wire.
+    /// The shared Adj-RIB-Out includes paths sourced by every member; BGP
+    /// split horizon means the member never received its own rows.
+    fn member_rows(&self, ident: usize) -> Vec<(Ipv4Net, BgpRib)> {
+        self.adj_out
+            .0
+            .iter()
+            .flat_map(|(prefix, ribs)| {
+                ribs.iter()
+                    .filter(move |rib| rib.ident != ident)
+                    .cloned()
+                    .map(move |rib| (*prefix, rib))
+            })
+            .collect()
+    }
+
+    fn finish_member_handoff(&mut self, ident: usize) {
+        let Some(pending) = self.pending_members.remove(&ident) else {
+            return;
+        };
+        let desired = self.member_rows(ident);
+        let wire_id = |rib: &BgpRib| if pending.add_path { rib.local_id } else { 0 };
+        let previous_keys: BTreeMap<(Ipv4Net, u32), BgpRib> = pending
+            .previous
+            .into_iter()
+            .map(|(prefix, rib)| ((prefix, wire_id(&rib)), rib))
+            .collect();
+        let desired_keys: BTreeMap<(Ipv4Net, u32), BgpRib> = desired
+            .into_iter()
+            .map(|(prefix, rib)| ((prefix, wire_id(&rib)), rib))
+            .collect();
+
+        // Remove only rows absent under the new owner. Replacements with the
+        // same NLRI are sent as UPDATEs below, avoiding a withdraw/announce
+        // flap for resolved-to-resolved policy changes.
+        for &(prefix, id) in previous_keys.keys() {
+            if !desired_keys.contains_key(&(prefix, id)) {
+                let mut update = UpdatePacket::with_max_packet_size(pending.ctx.max_packet_size());
+                update.ipv4_withdraw.push(Ipv4Nlri { id, prefix });
+                if let Ok(bytes) = update.try_emit() {
+                    pending.ctx.send_packet(bytes);
+                }
+            }
+        }
+        for ((prefix, id), rib) in desired_keys {
+            let unchanged = previous_keys
+                .get(&(prefix, id))
+                .is_some_and(|old| old.attr == rib.attr);
+            if unchanged {
+                continue;
+            }
+            let nlri = Ipv4Nlri { id, prefix };
+            for bytes in encode_ipv4_update(
+                &rib.attr,
+                &[nlri],
+                pending.ctx.max_packet_size(),
+                pending.ctx.as4,
+                pending.enhe_v6,
+            ) {
+                pending.ctx.send_packet(bytes);
+            }
+        }
+        self.members.insert(
+            ident,
+            Member {
+                ctx: pending.ctx,
+                enhe_v6: pending.enhe_v6,
+            },
+        );
     }
 }
 
@@ -375,8 +615,256 @@ mod tests {
             ident,
             ctx: Box::new(ctx),
             add_path: false,
+            enhe_v6: None,
         });
         rx
+    }
+
+    fn enhe_member(
+        engine: &mut Engine,
+        ident: usize,
+        enhe_v6: Ipv4MpReachNextHop,
+    ) -> mpsc::UnboundedReceiver<BytesMut> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut ctx = SyncCtx::for_test();
+        ctx.ident = ident;
+        ctx.packet_tx = Some(tx);
+        engine.handle(GroupEgressDeltaV4::AddMember {
+            ident,
+            ctx: Box::new(ctx),
+            add_path: false,
+            enhe_v6: Some(enhe_v6),
+        });
+        rx
+    }
+
+    #[test]
+    fn route_refresh_readvertises_only_requesting_member() {
+        let mut engine = Engine::default();
+        let mut rx1 = member(&mut engine, 1);
+        let mut rx2 = member(&mut engine, 2);
+        let prefix: Ipv4Net = "10.10.10.0/24".parse().unwrap();
+        let route = rib(9, "192.0.2.1");
+
+        engine.advertise(prefix, route.clone());
+        let _ = std::iter::from_fn(|| rx1.try_recv().ok()).count();
+        let _ = std::iter::from_fn(|| rx2.try_recv().ok()).count();
+        engine.advertise(prefix, route.clone());
+        assert!(rx1.try_recv().is_err());
+        assert!(rx2.try_recv().is_err());
+
+        engine.readvertise(1, prefix, route);
+        assert!(rx1.try_recv().is_ok());
+        assert!(
+            rx2.try_recv().is_err(),
+            "one peer's ROUTE-REFRESH must not fan to its group"
+        );
+    }
+
+    /// Both a newly-permitted replay and a per-session ROUTE-REFRESH must
+    /// use the requesting member's composed RFC 8950 next-hop.
+    #[test]
+    fn policy_replay_and_route_refresh_preserve_member_enhe() {
+        let mut engine = Engine::default();
+        let nh = Ipv4MpReachNextHop::LinkLocal("fe80::31".parse().unwrap());
+        let mut rx = enhe_member(&mut engine, 1, nh);
+        let prefix: Ipv4Net = "10.31.0.0/24".parse().unwrap();
+        let route = rib(9, "192.0.2.31");
+
+        engine.advertise(prefix, route.clone());
+        let advertised = &engine.adj_out.0[&prefix][0];
+        let golden = encode_ipv4_update(
+            &advertised.attr,
+            &[Ipv4Nlri { id: 0, prefix }],
+            engine.members[&1].ctx.max_packet_size(),
+            engine.members[&1].ctx.as4,
+            Some(nh),
+        );
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>(),
+            golden,
+            "newly allowed route uses ENHE"
+        );
+
+        engine.readvertise(1, prefix, route);
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>(),
+            golden,
+            "ROUTE-REFRESH uses ENHE"
+        );
+    }
+
+    #[test]
+    fn member_handoff_finish_preserves_pending_member_enhe() {
+        let mut engine = Engine::default();
+        let target = 7;
+        let nh = Ipv4MpReachNextHop::LinkLocal("fe80::37".parse().unwrap());
+        let (ctx, mut rx) = pending_ctx(target);
+        engine.handle(GroupEgressDeltaV4::BeginMemberHandoff {
+            ident: target,
+            ctx: Box::new(ctx),
+            add_path: false,
+            enhe_v6: Some(nh),
+            previous: Vec::new(),
+        });
+        let prefix: Ipv4Net = "10.37.0.0/24".parse().unwrap();
+        engine.advertise(prefix, rib(99, "192.0.2.37"));
+        assert!(rx.try_recv().is_err(), "pending member is not fanned to");
+
+        let advertised = &engine.adj_out.0[&prefix][0];
+        let golden = encode_ipv4_update(
+            &advertised.attr,
+            &[Ipv4Nlri { id: 0, prefix }],
+            bgp_packet::BGP_PACKET_LEN,
+            true,
+            Some(nh),
+        );
+        let (reply, _) = tokio::sync::oneshot::channel();
+        engine.handle(GroupEgressDeltaV4::FinishMemberHandoff {
+            ident: target,
+            reply,
+        });
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>(),
+            golden,
+            "handoff reconciliation uses the pending member's ENHE"
+        );
+    }
+
+    fn pending_ctx(ident: usize) -> (SyncCtx, mpsc::UnboundedReceiver<BytesMut>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut ctx = SyncCtx::for_test();
+        ctx.ident = ident;
+        ctx.packet_tx = Some(tx);
+        (ctx, rx)
+    }
+
+    #[test]
+    fn member_handoff_fences_old_owner_and_diffs_without_unchanged_flap() {
+        let keep: Ipv4Net = "192.0.2.0/24".parse().unwrap();
+        let remove: Ipv4Net = "198.51.100.0/24".parse().unwrap();
+        let add: Ipv4Net = "203.0.113.0/24".parse().unwrap();
+        let target = 7;
+
+        let mut old = Engine::default();
+        let mut old_rx = member(&mut old, target);
+        // A second member supplies the canonical build context.
+        let _other_rx = member(&mut old, 8);
+        old.handle(GroupEgressDeltaV4::Advertise {
+            prefix: keep,
+            rib: rib(99, "10.0.0.1"),
+        });
+        old.handle(GroupEgressDeltaV4::Advertise {
+            prefix: remove,
+            rib: rib(99, "10.0.0.1"),
+        });
+        // Discard the original advertisements; the handoff assertions start
+        // after the old owner is fenced.
+        while old_rx.try_recv().is_ok() {}
+
+        let (extract_tx, extract_rx) = tokio::sync::oneshot::channel();
+        old.handle(GroupEgressDeltaV4::ExtractMember {
+            ident: target,
+            reply: extract_tx,
+        });
+        let previous = extract_rx.blocking_recv().unwrap();
+        assert_eq!(previous.len(), 2);
+        let unchanged_keep = previous
+            .iter()
+            .find(|(prefix, _)| *prefix == keep)
+            .unwrap()
+            .1
+            .clone();
+        assert!(!old.members.contains_key(&target));
+
+        // Later old-owner deltas must not reach the fenced member.
+        old.handle(GroupEgressDeltaV4::Advertise {
+            prefix: add,
+            rib: rib(99, "10.0.0.1"),
+        });
+        assert!(old_rx.try_recv().is_err());
+
+        let mut new = Engine::default();
+        let (ctx, mut new_rx) = pending_ctx(target);
+        new.handle(GroupEgressDeltaV4::BeginMemberHandoff {
+            ident: target,
+            ctx: Box::new(ctx.clone()),
+            add_path: false,
+            enhe_v6: None,
+            previous,
+        });
+        // The existing whole-group soft-out refreshes every SyncCtx before
+        // replay. It must update, not prematurely activate, this member.
+        new.handle(GroupEgressDeltaV4::AddMember {
+            ident: target,
+            ctx: Box::new(ctx),
+            add_path: false,
+            enhe_v6: None,
+        });
+        assert!(!new.members.contains_key(&target));
+        // Loc-RIB replay under the new policy: `keep` is unchanged, `remove`
+        // is denied, and `add` is newly allowed. Pending members are not sent
+        // anything until Finish makes the transition in one ordered diff.
+        new.record_adj_out(keep, unchanged_keep);
+        new.record_adj_out(add, rib(99, "10.0.0.1"));
+        assert!(new_rx.try_recv().is_err());
+
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        new.handle(GroupEgressDeltaV4::FinishMemberHandoff {
+            ident: target,
+            reply: finish_tx,
+        });
+        finish_rx.blocking_recv().unwrap();
+        // Exactly one withdraw + one new advertisement. `keep` must not flap.
+        assert!(new_rx.try_recv().is_ok());
+        assert!(new_rx.try_recv().is_ok());
+        assert!(new_rx.try_recv().is_err());
+        assert!(new.members.contains_key(&target));
+        assert!(!new.pending_members.contains_key(&target));
+    }
+
+    #[test]
+    fn extracted_member_rejects_late_add_until_lifecycle_remove() {
+        let target = 7;
+        let mut engine = Engine::default();
+        let mut original_rx = member(&mut engine, target);
+        let prefix: Ipv4Net = "192.0.2.0/24".parse().unwrap();
+        engine.handle(GroupEgressDeltaV4::Advertise {
+            prefix,
+            rib: rib(99, "10.0.0.1"),
+        });
+        original_rx.try_recv().expect("initial advertisement");
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        engine.handle(GroupEgressDeltaV4::ExtractMember {
+            ident: target,
+            reply,
+        });
+        assert_eq!(rx.blocking_recv().unwrap().len(), 1);
+
+        // A soft-out queued by the old owner before it learned about the
+        // extraction must not resurrect this member.
+        let mut late_rx = member(&mut engine, target);
+        assert!(!engine.members.contains_key(&target));
+        engine.handle(GroupEgressDeltaV4::Readvertise {
+            ident: target,
+            prefix,
+            rib: rib(99, "10.0.0.1"),
+        });
+        assert!(late_rx.try_recv().is_err());
+
+        // Session teardown/cancellation ends the tombstone lifetime; a later
+        // session may attach normally.
+        engine.handle(GroupEgressDeltaV4::RemoveMember { ident: target });
+        let mut next_session_rx = member(&mut engine, target);
+        engine.handle(GroupEgressDeltaV4::Readvertise {
+            ident: target,
+            prefix,
+            rib: rib(99, "10.0.0.1"),
+        });
+        next_session_rx
+            .try_recv()
+            .expect("new lifecycle may attach after RemoveMember");
     }
 
     /// `src` becomes the path's source (`rib.ident`) — the split-horizon
@@ -421,12 +909,80 @@ mod tests {
             prefix,
             rib: rib(source, "192.0.2.7"),
         });
-
         assert!(source_rx.try_recv().is_err(), "split horizon sends nothing");
         assert!(
             !engine.adj_out.0.contains_key(&prefix),
             "a route received by no member is not actual Adj-RIB-Out"
         );
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        engine.handle(GroupEgressDeltaV4::ExtractMember {
+            ident: source,
+            reply,
+        });
+        assert!(
+            rx.blocking_recv().unwrap().is_empty(),
+            "handoff baseline contains only rows that could be on this wire"
+        );
+
+        // A later lifecycle obtains the route through Loc-RIB sync/replay;
+        // the prior phantom must not suppress that required advertisement.
+        engine.handle(GroupEgressDeltaV4::RemoveMember { ident: source });
+        let mut receiver_rx = member(&mut engine, 8);
+        engine.handle(GroupEgressDeltaV4::Advertise {
+            prefix,
+            rib: rib(source, "192.0.2.7"),
+        });
+        receiver_rx
+            .try_recv()
+            .expect("later non-source replay is advertised");
+    }
+
+    #[test]
+    fn first_member_receives_permitted_local_origin_and_filters_denied_one() {
+        use super::super::policy::{OutPolicy, PolicyListValue, PrefixSetValue};
+        use super::super::route::ORIGINATED_PEER;
+        use crate::policy::{PrefixSet, prefix::set::PrefixSetEntry};
+        use ipnet::IpNet;
+
+        let allow: Ipv4Net = "10.21.0.0/24".parse().unwrap();
+        let deny: Ipv4Net = "10.21.99.0/24".parse().unwrap();
+        let mut set = PrefixSet::default();
+        set.insert(IpNet::V4(allow), PrefixSetEntry::default());
+
+        let mut engine = Engine::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut ctx = SyncCtx::for_test();
+        ctx.ident = 0;
+        ctx.packet_tx = Some(tx);
+        ctx.out_policy = Arc::new(OutPolicy {
+            prefix_set: PrefixSetValue {
+                name: Some("LOCAL-OUT".to_string()),
+                prefix_set: Some(set),
+            },
+            policy_list: PolicyListValue::default(),
+        });
+        engine.handle(GroupEgressDeltaV4::AddMember {
+            ident: 0,
+            ctx: Box::new(ctx),
+            add_path: false,
+            enhe_v6: None,
+        });
+
+        engine.handle(GroupEgressDeltaV4::Advertise {
+            prefix: allow,
+            rib: rib(ORIGINATED_PEER, "192.0.2.1"),
+        });
+        engine.handle(GroupEgressDeltaV4::Advertise {
+            prefix: deny,
+            rib: rib(ORIGINATED_PEER, "192.0.2.1"),
+        });
+
+        rx.try_recv()
+            .expect("peer slot zero receives permitted local route");
+        assert!(rx.try_recv().is_err(), "denied local route emits no UPDATE");
+        assert!(engine.adj_out.0.contains_key(&allow));
+        assert!(!engine.adj_out.0.contains_key(&deny));
     }
 
     #[test]

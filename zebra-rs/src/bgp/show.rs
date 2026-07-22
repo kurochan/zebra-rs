@@ -2874,8 +2874,16 @@ struct PolicyBindingView {
     policy_out: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefix_set_in: Option<String>,
+    /// Whether the named inbound prefix-set currently resolves. Present
+    /// only when `prefix_set_in` is present, so JSON consumers can
+    /// distinguish an unresolved (fail-close) reference from no binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix_set_in_resolved: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefix_set_out: Option<String>,
+    /// Outbound twin of `prefix_set_in_resolved`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix_set_out_resolved: Option<bool>,
 }
 
 impl PolicyBindingView {
@@ -2900,24 +2908,44 @@ fn collect_policy_bindings(peer: &Peer) -> Vec<PolicyBindingView> {
     for af in families {
         let pl = peer.policy_list.get(&af);
         let ps = peer.prefix_set.get(&af);
+        let prefix_set_in = ps.and_then(|io| io.get(&InOut::Input).name.clone());
+        let prefix_set_out = ps.and_then(|io| io.get(&InOut::Output).name.clone());
         let row = PolicyBindingView {
             scope: afi_safi_config_name(&af).to_string(),
             policy_in: pl.and_then(|io| io.get(&InOut::Input).name.clone()),
             policy_out: pl.and_then(|io| io.get(&InOut::Output).name.clone()),
-            prefix_set_in: ps.and_then(|io| io.get(&InOut::Input).name.clone()),
-            prefix_set_out: ps.and_then(|io| io.get(&InOut::Output).name.clone()),
+            prefix_set_in_resolved: prefix_set_in.as_ref().map(|_| {
+                ps.and_then(|io| io.get(&InOut::Input).prefix_set.as_ref())
+                    .is_some()
+            }),
+            prefix_set_out_resolved: prefix_set_out.as_ref().map(|_| {
+                ps.and_then(|io| io.get(&InOut::Output).prefix_set.as_ref())
+                    .is_some()
+            }),
+            prefix_set_in,
+            prefix_set_out,
         };
         if !row.is_empty() {
             out.push(row);
         }
     }
 
+    let legacy_prefix_set_in = peer.prefix_set_legacy.get(&InOut::Input);
+    let legacy_prefix_set_out = peer.prefix_set_legacy.get(&InOut::Output);
     let legacy = PolicyBindingView {
         scope: "(peer-wide)".to_string(),
         policy_in: peer.policy_list_legacy.get(&InOut::Input).name.clone(),
         policy_out: peer.policy_list_legacy.get(&InOut::Output).name.clone(),
-        prefix_set_in: peer.prefix_set_legacy.get(&InOut::Input).name.clone(),
-        prefix_set_out: peer.prefix_set_legacy.get(&InOut::Output).name.clone(),
+        prefix_set_in: legacy_prefix_set_in.name.clone(),
+        prefix_set_in_resolved: legacy_prefix_set_in
+            .name
+            .as_ref()
+            .map(|_| legacy_prefix_set_in.prefix_set.is_some()),
+        prefix_set_out: legacy_prefix_set_out.name.clone(),
+        prefix_set_out_resolved: legacy_prefix_set_out
+            .name
+            .as_ref()
+            .map(|_| legacy_prefix_set_out.prefix_set.is_some()),
     };
     if !legacy.is_empty() {
         out.push(legacy);
@@ -3398,10 +3426,44 @@ fn render(out: &mut String, neighbor: &Neighbor) -> std::fmt::Result {
 
     // Configured route-policy / prefix-set, per address family, with the
     // legacy peer-wide fallback last. A family-scoped binding takes
-    // priority over `(peer-wide)` for routes of that family.
+    // priority over `(peer-wide)` for routes of that family. Prefix-set
+    // names are always shown; an unresolved reference is marked explicitly
+    // because route evaluation fail-closes while it remains unresolved.
     if !neighbor.policy_bindings.is_empty() {
         writeln!(out, "  Policy:")?;
         for b in &neighbor.policy_bindings {
+            if b.scope != "(peer-wide)" {
+                let family = match b.scope.as_str() {
+                    "ipv4" => "IPv4 Unicast",
+                    "ipv6" => "IPv6 Unicast",
+                    other => other,
+                };
+                writeln!(out, "    Address family: {family}")?;
+                if let Some(ref n) = b.policy_in {
+                    writeln!(out, "      Policy in:      {n}")?;
+                }
+                if let Some(ref n) = b.policy_out {
+                    writeln!(out, "      Policy out:     {n}")?;
+                }
+                if let Some(ref n) = b.prefix_set_in {
+                    let suffix = if b.prefix_set_in_resolved == Some(false) {
+                        " (unresolved)"
+                    } else {
+                        ""
+                    };
+                    writeln!(out, "      Prefix-set in:  {n}{suffix}")?;
+                }
+                if let Some(ref n) = b.prefix_set_out {
+                    let suffix = if b.prefix_set_out_resolved == Some(false) {
+                        " (unresolved)"
+                    } else {
+                        ""
+                    };
+                    writeln!(out, "      Prefix-set out: {n}{suffix}")?;
+                }
+                continue;
+            }
+
             let mut parts: Vec<String> = Vec::new();
             if let Some(ref n) = b.policy_in {
                 parts.push(format!("policy in {n}"));
@@ -3410,10 +3472,20 @@ fn render(out: &mut String, neighbor: &Neighbor) -> std::fmt::Result {
                 parts.push(format!("policy out {n}"));
             }
             if let Some(ref n) = b.prefix_set_in {
-                parts.push(format!("prefix-set in {n}"));
+                let suffix = if b.prefix_set_in_resolved == Some(false) {
+                    " (unresolved)"
+                } else {
+                    ""
+                };
+                parts.push(format!("prefix-set in {n}{suffix}"));
             }
             if let Some(ref n) = b.prefix_set_out {
-                parts.push(format!("prefix-set out {n}"));
+                let suffix = if b.prefix_set_out_resolved == Some(false) {
+                    " (unresolved)"
+                } else {
+                    ""
+                };
+                parts.push(format!("prefix-set out {n}{suffix}"));
             }
             writeln!(out, "    {}: {}", b.scope, parts.join(", "))?;
         }
@@ -5666,26 +5738,66 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
                 policy_in: Some("IN4".to_string()),
                 policy_out: None,
                 prefix_set_in: Some("PFX4".to_string()),
+                prefix_set_in_resolved: Some(true),
                 prefix_set_out: None,
+                prefix_set_out_resolved: None,
             },
             PolicyBindingView {
                 scope: "(peer-wide)".to_string(),
                 policy_in: Some("LEGACY".to_string()),
                 policy_out: None,
                 prefix_set_in: None,
+                prefix_set_in_resolved: None,
                 prefix_set_out: None,
+                prefix_set_out_resolved: None,
             },
         ];
         render(&mut out, &n).unwrap();
         assert!(out.contains("  Policy:"), "missing Policy header:\n{out}");
         assert!(
-            out.contains("    ipv4: policy in IN4, prefix-set in PFX4"),
+            out.contains("    Address family: IPv4 Unicast"),
             "missing per-AFI row:\n{out}"
         );
+        assert!(out.contains("      Policy in:      IN4"), "{out}");
+        assert!(out.contains("      Prefix-set in:  PFX4"), "{out}");
         assert!(
             out.contains("    (peer-wide): policy in LEGACY"),
             "missing legacy row:\n{out}"
         );
+    }
+
+    /// Text and JSON both expose an unresolved prefix-set reference. The
+    /// name remains visible while the explicit status tells operators and
+    /// API consumers that route evaluation is currently fail-close.
+    #[test]
+    fn policy_block_marks_unresolved_prefix_set_in_text_and_json() {
+        let mut out = String::new();
+        let mut n = minimal_neighbor(None);
+        n.policy_bindings = vec![PolicyBindingView {
+            scope: "ipv4".to_string(),
+            policy_in: None,
+            policy_out: None,
+            prefix_set_in: Some("PEER-IN-V4".to_string()),
+            prefix_set_in_resolved: Some(true),
+            prefix_set_out: Some("PEER-OUT-V4".to_string()),
+            prefix_set_out_resolved: Some(false),
+        }];
+
+        render(&mut out, &n).unwrap();
+        assert!(out.contains("Address family: IPv4 Unicast"), "{out}");
+        assert!(out.contains("Prefix-set in:  PEER-IN-V4"), "{out}");
+        assert!(
+            out.contains("Prefix-set out: PEER-OUT-V4 (unresolved)"),
+            "{out}"
+        );
+
+        let value = serde_json::to_value(&n).unwrap();
+        let binding = &value["policy_bindings"][0];
+        assert_eq!(binding["scope"], "ipv4");
+        assert_eq!(binding["prefix_set_in"], "PEER-IN-V4");
+        assert_eq!(binding["prefix_set_in_resolved"], true);
+        assert_eq!(binding["prefix_set_out"], "PEER-OUT-V4");
+        assert_eq!(binding["prefix_set_out_resolved"], false);
     }
 
     /// JSON output for an interface-keyed peer carries the three ND

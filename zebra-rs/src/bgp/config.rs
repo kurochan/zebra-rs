@@ -206,6 +206,7 @@ fn reassign_all_update_groups(bgp: &mut Bgp) {
             ident,
             router_id,
             bgp.as_sets_withdraw,
+            &bgp.interface_addrs,
         );
     }
 }
@@ -4427,6 +4428,14 @@ impl Bgp {
         self.callback_add(
             "/router/bgp/vrf/neighbor/afi-safi/enabled",
             super::vrf_config::config_vrf_neighbor_afi_safi_enabled,
+        );
+        self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/prefix-set/in",
+            super::vrf_config::config_vrf_neighbor_afi_safi_prefix_set_in,
+        );
+        self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/prefix-set/out",
+            super::vrf_config::config_vrf_neighbor_afi_safi_prefix_set_out,
         );
         self.callback_add(
             "/router/bgp/vrf/afi-safi/ipv4",

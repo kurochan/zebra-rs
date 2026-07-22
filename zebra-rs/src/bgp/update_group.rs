@@ -261,6 +261,11 @@ pub struct UpdateGroup {
     pub cache_ipv4: HashMap<Arc<BgpAttr>, HashMap<Ipv4Nlri, usize>>,
     /// Reverse map for O(1) cache_remove. NLRI → bucket key.
     pub cache_ipv4_rev: HashMap<Ipv4Nlri, Arc<BgpAttr>>,
+    /// Members that must not receive a particular pending NLRI.  A policy
+    /// handoff can detach and reattach a member to the same signature before
+    /// the shared MRAI cache flushes; the cache therefore needs recipient
+    /// ownership in addition to the route's source-ident.
+    pub cache_ipv4_excluded: HashMap<Ipv4Nlri, BTreeSet<usize>>,
     /// Adv-debounce timer. Started on first send; on fire,
     /// `Bgp::serve` drains the cache and ships UPDATEs to members.
     pub cache_ipv4_timer: Option<Timer>,
@@ -272,6 +277,7 @@ pub struct UpdateGroup {
     // next-hop rides in the bucket key attr (`BgpNexthop::Ipv6`).
     pub cache_ipv6: HashMap<Arc<BgpAttr>, HashMap<Ipv6Nlri, usize>>,
     pub cache_ipv6_rev: HashMap<Ipv6Nlri, Arc<BgpAttr>>,
+    pub cache_ipv6_excluded: HashMap<Ipv6Nlri, BTreeSet<usize>>,
     pub cache_ipv6_timer: Option<Timer>,
 
     /// Snapshot of `Bgp::adv_interval` captured at group creation
@@ -296,10 +302,16 @@ pub struct UpdateGroup {
     pub flush_pending_ipv4: bool,
     /// `(ident, nlri)` withdraws parked during an IPv4 flight.
     pub deferred_withdraw_ipv4: Vec<(usize, Ipv4Nlri)>,
+    /// Members changing update-group ownership. New flush snapshots exclude
+    /// them; an already-running snapshot is fenced by `drain_waiters_ipv4`.
+    pub draining_members_ipv4: BTreeSet<usize>,
+    pub drain_waiters_ipv4: BTreeMap<usize, Vec<tokio::sync::oneshot::Sender<()>>>,
     /// IPv6 twins of the three fields above.
     pub flush_inflight_ipv6: bool,
     pub flush_pending_ipv6: bool,
     pub deferred_withdraw_ipv6: Vec<(usize, Ipv6Nlri)>,
+    pub draining_members_ipv6: BTreeSet<usize>,
+    pub drain_waiters_ipv6: BTreeMap<usize, Vec<tokio::sync::oneshot::Sender<()>>>,
     /// Per-update-group egress task (see
     /// `docs/design/bgp-egress-group-task-migration.md`). `Some` only at
     /// gate-on (`ZEBRA_BGP_EGRESS_GROUP_TASK`); spawned when the group is
@@ -501,6 +513,78 @@ pub fn attach(
     peer_idx: usize,
     router_id: Ipv4Addr,
     as_sets_withdraw: bool,
+    interface_addrs: &super::interface_addrs::InterfaceAddrs,
+) {
+    attach_inner(
+        update_groups,
+        peers,
+        peer_idx,
+        router_id,
+        as_sets_withdraw,
+        interface_addrs,
+        false,
+        None,
+    );
+}
+
+/// Attach one negotiated AFI/SAFI without disturbing the peer's other
+/// memberships. Policy handoffs are family-scoped and may overlap for a
+/// dual-stack peer.
+pub fn attach_family(
+    update_groups: &mut UpdateGroupMap,
+    peers: &mut PeerMap,
+    peer_idx: usize,
+    afi_safi: AfiSafi,
+    router_id: Ipv4Addr,
+    as_sets_withdraw: bool,
+    interface_addrs: &super::interface_addrs::InterfaceAddrs,
+) {
+    attach_inner(
+        update_groups,
+        peers,
+        peer_idx,
+        router_id,
+        as_sets_withdraw,
+        interface_addrs,
+        false,
+        Some(afi_safi),
+    );
+}
+
+/// Attach after an IPv4 group-egress ownership transfer has begun. The peer's
+/// update-group back-reference and map membership are installed normally, but
+/// the v4 task does not receive `AddMember`: the caller must immediately send
+/// `BeginMemberHandoff`, replay the Loc-RIB, and finish the handoff. This keeps
+/// the peer out of fan-out during the state transfer.
+pub fn attach_for_v4_handoff(
+    update_groups: &mut UpdateGroupMap,
+    peers: &mut PeerMap,
+    peer_idx: usize,
+    router_id: Ipv4Addr,
+    as_sets_withdraw: bool,
+    interface_addrs: &super::interface_addrs::InterfaceAddrs,
+) {
+    attach_inner(
+        update_groups,
+        peers,
+        peer_idx,
+        router_id,
+        as_sets_withdraw,
+        interface_addrs,
+        true,
+        Some(AfiSafi::new(Afi::Ip, Safi::Unicast)),
+    );
+}
+
+fn attach_inner(
+    update_groups: &mut UpdateGroupMap,
+    peers: &mut PeerMap,
+    peer_idx: usize,
+    router_id: Ipv4Addr,
+    as_sets_withdraw: bool,
+    interface_addrs: &super::interface_addrs::InterfaceAddrs,
+    v4_handoff: bool,
+    family: Option<AfiSafi>,
 ) {
     let Some(peer) = peers.get_by_idx(peer_idx) else {
         return;
@@ -513,8 +597,12 @@ pub fn attach(
     let adv_interval = peer.adv_interval;
     let mut sigs: Vec<(AfiSafi, UpdateGroupSig)> = Vec::new();
     for (afi, safi) in TRACKED_AFI_SAFIS {
+        let afi_safi = AfiSafi::new(afi, safi);
+        if family.is_some_and(|family| family != afi_safi) {
+            continue;
+        }
         if let Some(sig) = signature_of(peer, afi, safi) {
-            sigs.push((AfiSafi::new(afi, safi), sig));
+            sigs.push((afi_safi, sig));
         }
     }
 
@@ -538,17 +626,23 @@ pub fn attach(
                 counters: UpdateGroupCounters::default(),
                 cache_ipv4: HashMap::new(),
                 cache_ipv4_rev: HashMap::new(),
+                cache_ipv4_excluded: HashMap::new(),
                 cache_ipv4_timer: None,
                 cache_ipv6: HashMap::new(),
                 cache_ipv6_rev: HashMap::new(),
+                cache_ipv6_excluded: HashMap::new(),
                 cache_ipv6_timer: None,
                 adv_interval,
                 flush_inflight_ipv4: false,
                 flush_pending_ipv4: false,
                 deferred_withdraw_ipv4: Vec::new(),
+                draining_members_ipv4: BTreeSet::new(),
+                drain_waiters_ipv4: BTreeMap::new(),
                 flush_inflight_ipv6: false,
                 flush_pending_ipv6: false,
                 deferred_withdraw_ipv6: Vec::new(),
+                draining_members_ipv6: BTreeSet::new(),
+                drain_waiters_ipv6: BTreeMap::new(),
                 task,
             }
         });
@@ -557,13 +651,19 @@ pub fn attach(
         // member's SyncCtx (its packet sink + the shared egress identity) so the
         // engine can build + fan once advertises are routed there (later).
         if let Some(t) = &entry.task
+            && !(v4_handoff && afi_safi == AfiSafi::new(Afi::Ip, Safi::Unicast))
             && let Some(peer) = peers.get_by_idx(peer_idx)
         {
             let add_path = peer.opt.is_add_path_send(afi_safi.afi, afi_safi.safi);
+            let enhe_v6 = peer
+                .is_enhe_v4_negotiated()
+                .then(|| compose_enhe_next_hop(peer, interface_addrs))
+                .flatten();
             t.send(super::group_egress::GroupEgressDeltaV4::AddMember {
                 ident: peer_idx,
                 ctx: Box::new(peer.sync_ctx(router_id, as_sets_withdraw)),
                 add_path,
+                enhe_v6,
             });
         }
 
@@ -594,32 +694,179 @@ pub fn detach(update_groups: &mut UpdateGroupMap, peers: &mut PeerMap, peer_idx:
     };
 
     for (afi_safi, id) in memberships {
-        let Some(af) = update_groups.get_mut(&afi_safi) else {
-            continue;
+        detach_membership(update_groups, peer_idx, afi_safi, id, false);
+    }
+}
+
+/// Remove one AFI/SAFI membership while preserving every other family. This
+/// is required when v4 and v6 policy handoffs overlap for the same peer.
+pub fn detach_family(
+    update_groups: &mut UpdateGroupMap,
+    peers: &mut PeerMap,
+    peer_idx: usize,
+    afi_safi: AfiSafi,
+) {
+    let Some(id) = peers
+        .get_mut_by_idx(peer_idx)
+        .and_then(|peer| peer.update_group_id.remove(&afi_safi))
+    else {
+        return;
+    };
+    // Family detach is the policy-handoff primitive.  Preserve recipient
+    // exclusions until the member is attached to its new (possibly identical)
+    // signature; otherwise the old MRAI cache can regain ownership in between.
+    detach_membership(update_groups, peer_idx, afi_safi, id, true);
+}
+
+fn detach_membership(
+    update_groups: &mut UpdateGroupMap,
+    peer_idx: usize,
+    afi_safi: AfiSafi,
+    id: UpdateGroupId,
+    preserve_pending_exclusions: bool,
+) {
+    let Some(af) = update_groups.get_mut(&afi_safi) else {
+        return;
+    };
+    let key = af
+        .groups
+        .iter()
+        .find(|(_, g)| g.id == id)
+        .map(|(k, _)| k.clone());
+    if let Some(key) = key {
+        let drop_group = {
+            let group = af.groups.get_mut(&key).expect("just located");
+            group.members.remove(&peer_idx);
+            group.draining_members_ipv4.remove(&peer_idx);
+            // Session teardown cancels an in-progress ownership transfer.
+            // Dropping the senders makes the continuation observe Err
+            // instead of accidentally attaching a now-down peer.
+            group.drain_waiters_ipv4.remove(&peer_idx);
+            group.draining_members_ipv6.remove(&peer_idx);
+            group.drain_waiters_ipv6.remove(&peer_idx);
+            if !preserve_pending_exclusions {
+                group.cache_ipv4_excluded.retain(|_, members| {
+                    members.remove(&peer_idx);
+                    !members.is_empty()
+                });
+                group.cache_ipv6_excluded.retain(|_, members| {
+                    members.remove(&peer_idx);
+                    !members.is_empty()
+                });
+            }
+            // Mirror the removal into the group's egress task (the task
+            // itself is dropped + aborted below if the group empties).
+            if let Some(t) = &group.task {
+                t.send(super::group_egress::GroupEgressDeltaV4::RemoveMember { ident: peer_idx });
+            }
+            group.members.is_empty()
         };
-        let key = af
-            .groups
-            .iter()
-            .find(|(_, g)| g.id == id)
-            .map(|(k, _)| k.clone());
-        if let Some(key) = key {
-            let drop_group = {
-                let group = af.groups.get_mut(&key).expect("just located");
-                group.members.remove(&peer_idx);
-                // Mirror the removal into the group's egress task (the task
-                // itself is dropped + aborted below if the group empties).
-                if let Some(t) = &group.task {
-                    t.send(super::group_egress::GroupEgressDeltaV4::RemoveMember {
-                        ident: peer_idx,
-                    });
-                }
-                group.members.is_empty()
-            };
-            if drop_group {
-                af.groups.remove(&key);
+        if drop_group {
+            af.groups.remove(&key);
+        }
+    }
+}
+
+/// Fence one member from the gate-off IPv4 update-group flush path.
+///
+/// New flush snapshots exclude the member immediately. If a worker already
+/// owns an older snapshot containing it, the returned receiver resolves only
+/// after that worker has enqueued every packet. A policy-rebind continuation
+/// can then detach/attach and run its targeted Adj-RIB-Out diff; those packets
+/// are guaranteed to land after every old-owner advertisement.
+pub fn fence_member_ipv4(
+    update_groups: &mut UpdateGroupMap,
+    peers: &PeerMap,
+    peer_idx: usize,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
+    let Some(gid) = peers
+        .get_by_idx(peer_idx)
+        .and_then(|peer| peer.update_group_id.get(&afi_safi))
+    else {
+        let _ = reply.send(());
+        return rx;
+    };
+    let Some(group) = update_groups
+        .get_mut(&afi_safi)
+        .and_then(|af| af.group_by_id_mut(gid))
+    else {
+        let _ = reply.send(());
+        return rx;
+    };
+    // Preserve the recipient fence on the queued entries themselves.  The
+    // member can be detached and reattached to this same group before MRAI
+    // fires, at which point `draining_members_ipv4` alone is no protection.
+    for entries in group.cache_ipv4.values() {
+        for (nlri, source) in entries {
+            if *source != peer_idx {
+                group
+                    .cache_ipv4_excluded
+                    .entry(nlri.clone())
+                    .or_default()
+                    .insert(peer_idx);
             }
         }
     }
+    group.draining_members_ipv4.insert(peer_idx);
+    if group.flush_inflight_ipv4 {
+        group
+            .drain_waiters_ipv4
+            .entry(peer_idx)
+            .or_default()
+            .push(reply);
+    } else {
+        let _ = reply.send(());
+    }
+    rx
+}
+
+/// IPv6 twin of [`fence_member_ipv4`]. IPv6 has its own cache and worker, so
+/// an outbound IPv6 binding change must fence this latch independently.
+pub fn fence_member_ipv6(
+    update_groups: &mut UpdateGroupMap,
+    peers: &PeerMap,
+    peer_idx: usize,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let afi_safi = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+    let Some(gid) = peers
+        .get_by_idx(peer_idx)
+        .and_then(|peer| peer.update_group_id.get(&afi_safi))
+    else {
+        let _ = reply.send(());
+        return rx;
+    };
+    let Some(group) = update_groups
+        .get_mut(&afi_safi)
+        .and_then(|af| af.group_by_id_mut(gid))
+    else {
+        let _ = reply.send(());
+        return rx;
+    };
+    for entries in group.cache_ipv6.values() {
+        for (nlri, source) in entries {
+            if *source != peer_idx {
+                group
+                    .cache_ipv6_excluded
+                    .entry(nlri.clone())
+                    .or_default()
+                    .insert(peer_idx);
+            }
+        }
+    }
+    group.draining_members_ipv6.insert(peer_idx);
+    if group.flush_inflight_ipv6 {
+        group
+            .drain_waiters_ipv6
+            .entry(peer_idx)
+            .or_default()
+            .push(reply);
+    } else {
+        let _ = reply.send(());
+    }
+    rx
 }
 
 // ── IPv4 unicast send / cache_remove / flush ──
@@ -651,7 +898,20 @@ pub fn send_ipv4(
         .entry(attr.clone())
         .or_default()
         .insert(nlri.clone(), source_ident);
-    group.cache_ipv4_rev.insert(nlri, attr);
+    group.cache_ipv4_rev.insert(nlri.clone(), attr);
+    // A new group-derived advertisement supersedes any old recipient fence
+    // for active members.  Members currently changing owner remain excluded.
+    let excluded = group.cache_ipv4_excluded.entry(nlri.clone()).or_default();
+    for member in &group.members {
+        if group.draining_members_ipv4.contains(member) {
+            excluded.insert(*member);
+        } else {
+            excluded.remove(member);
+        }
+    }
+    if excluded.is_empty() {
+        group.cache_ipv4_excluded.remove(&nlri);
+    }
     if kick_timer && group.cache_ipv4_timer.is_none() {
         let secs = group.adv_interval.secs_for(group.sig.peer_type);
         group.cache_ipv4_timer = Some(start_adv_timer_ipv4(tx, &group.id, secs));
@@ -674,6 +934,25 @@ pub fn cache_remove_ipv4(group: &mut UpdateGroup, prefix: ipnet::Ipv4Net, id: u3
         if bucket.is_empty() {
             group.cache_ipv4.remove(&attr);
         }
+    }
+    group.cache_ipv4_excluded.remove(&nlri);
+}
+
+/// Suppress one member from a shared pending advertisement without deleting
+/// the entry needed by the group's other members.
+pub fn cache_exclude_ipv4(
+    group: &mut UpdateGroup,
+    prefix: ipnet::Ipv4Net,
+    id: u32,
+    peer_idx: usize,
+) {
+    let nlri = Ipv4Nlri { id, prefix };
+    if group.cache_ipv4_rev.contains_key(&nlri) {
+        group
+            .cache_ipv4_excluded
+            .entry(nlri)
+            .or_default()
+            .insert(peer_idx);
     }
 }
 
@@ -754,8 +1033,9 @@ impl FlushNlri for Ipv6Nlri {
 /// execute inline today and on a worker in Phase A.2 of the sharding
 /// plan (`docs/design/bgp-rib-sharding-plan.md`).
 pub(super) struct FlushJob<N> {
-    /// Bucket shape is `(attr, [(nlri, source_ident)])`.
-    pub buckets: Vec<(Arc<BgpAttr>, Vec<(N, usize)>)>,
+    /// Bucket shape is
+    /// `(attr, [(nlri, source_ident, excluded_recipients)])`.
+    pub buckets: Vec<(Arc<BgpAttr>, Vec<(N, usize, BTreeSet<usize>)>)>,
     pub members: Vec<FlushMember>,
     pub max_packet_size: usize,
     /// Group negotiated 4-octet AS encoding (RFC 6793) — sig field, so
@@ -788,12 +1068,17 @@ impl<N: FlushNlri> FlushJob<N> {
             // case is empty (group has no source-members for this
             // bucket), in which case every member shares the
             // canonical UPDATE.
-            let source_idents: BTreeSet<usize> = entries.iter().map(|(_, src)| *src).collect();
-            let pruned_members: Vec<usize> = self
+            let source_idents: BTreeSet<usize> = entries.iter().map(|(_, src, _)| *src).collect();
+            let tailored_members: Vec<usize> = self
                 .members
                 .iter()
                 .map(|m| m.ident)
-                .filter(|m| source_idents.contains(m))
+                .filter(|member| {
+                    source_idents.contains(member)
+                        || entries
+                            .iter()
+                            .any(|(_, _, excluded)| excluded.contains(member))
+                })
                 .collect();
 
             // RFC 9494 §4.3: an LLGR_STALE-tagged bucket reaches only
@@ -826,11 +1111,13 @@ impl<N: FlushNlri> FlushJob<N> {
                     };
                     let nlris: Vec<N> = entries
                         .iter()
-                        .filter(|(_, src)| *src != ctx.ident)
-                        .map(|(n, _)| n.clone())
+                        .filter(|(_, src, excluded)| {
+                            *src != ctx.ident && !excluded.contains(&ctx.ident)
+                        })
+                        .map(|(n, _, _)| n.clone())
                         .collect();
                     if nlris.is_empty() {
-                        if pruned_members.contains(&ctx.ident) {
+                        if source_idents.contains(&ctx.ident) {
                             counters.split_horizon_excluded += 1;
                         }
                         continue;
@@ -844,7 +1131,7 @@ impl<N: FlushNlri> FlushJob<N> {
                     counters.messages_formatted += bytes_list.len() as u64;
                     counters.messages_replicated += bytes_list.len() as u64;
                     counters.bytes_formatted += byte_total as u64;
-                    if pruned_members.contains(&ctx.ident) {
+                    if source_idents.contains(&ctx.ident) {
                         counters.split_horizon_excluded += 1;
                     }
                 }
@@ -852,7 +1139,7 @@ impl<N: FlushNlri> FlushJob<N> {
             }
 
             // Canonical UPDATE: every NLRI in the bucket.
-            let canonical: Vec<N> = entries.iter().map(|(n, _)| n.clone()).collect();
+            let canonical: Vec<N> = entries.iter().map(|(n, _, _)| n.clone()).collect();
             let canonical_bytes =
                 N::encode(&attr, &canonical, self.max_packet_size, self.as4, None);
             let canonical_byte_total: usize = canonical_bytes.iter().map(|b| b.len()).sum();
@@ -864,7 +1151,7 @@ impl<N: FlushNlri> FlushJob<N> {
 
             // Send canonical to every non-pruned member.
             for ctx in &self.members {
-                if pruned_members.contains(&ctx.ident) {
+                if tailored_members.contains(&ctx.ident) {
                     continue;
                 }
                 if llgr_stale_bucket && !ctx.llgr_ok {
@@ -881,7 +1168,7 @@ impl<N: FlushNlri> FlushJob<N> {
 
             // Per pruned member: encode bucket minus its sourced
             // NLRIs, then send.
-            for prune_ident in pruned_members {
+            for prune_ident in tailored_members {
                 if llgr_stale_bucket
                     && !self
                         .members
@@ -894,18 +1181,24 @@ impl<N: FlushNlri> FlushJob<N> {
                 }
                 let nlris: Vec<N> = entries
                     .iter()
-                    .filter(|(_, src)| *src != prune_ident)
-                    .map(|(n, _)| n.clone())
+                    .filter(|(_, src, excluded)| {
+                        *src != prune_ident && !excluded.contains(&prune_ident)
+                    })
+                    .map(|(n, _, _)| n.clone())
                     .collect();
                 if nlris.is_empty() {
-                    counters.split_horizon_excluded += 1;
+                    if source_idents.contains(&prune_ident) {
+                        counters.split_horizon_excluded += 1;
+                    }
                     continue;
                 }
                 let pruned_bytes = N::encode(&attr, &nlris, self.max_packet_size, self.as4, None);
                 let pruned_byte_total: usize = pruned_bytes.iter().map(|b| b.len()).sum();
                 counters.messages_formatted += pruned_bytes.len() as u64;
                 counters.bytes_formatted += pruned_byte_total as u64;
-                counters.split_horizon_excluded += 1;
+                if source_idents.contains(&prune_ident) {
+                    counters.split_horizon_excluded += 1;
+                }
                 if let Some(tx) = self
                     .members
                     .iter()
@@ -936,10 +1229,20 @@ pub(super) fn build_flush_job_ipv4(
 ) -> Option<FlushJob<Ipv4Nlri>> {
     let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
     group.cache_ipv4_timer = None;
-    let buckets: Vec<(Arc<BgpAttr>, Vec<(Ipv4Nlri, usize)>)> = group
+    let excluded = std::mem::take(&mut group.cache_ipv4_excluded);
+    let buckets: Vec<(Arc<BgpAttr>, Vec<(Ipv4Nlri, usize, BTreeSet<usize>)>)> = group
         .cache_ipv4
         .drain()
-        .map(|(attr, set)| (attr, set.into_iter().collect()))
+        .map(|(attr, set)| {
+            let entries = set
+                .into_iter()
+                .map(|(nlri, source)| {
+                    let suppressed = excluded.get(&nlri).cloned().unwrap_or_default();
+                    (nlri, source, suppressed)
+                })
+                .collect();
+            (attr, entries)
+        })
         .collect();
     group.cache_ipv4_rev.clear();
     if buckets.is_empty() {
@@ -954,6 +1257,7 @@ pub(super) fn build_flush_job_ipv4(
     let members: Vec<FlushMember> = group
         .members
         .iter()
+        .filter(|ident| !group.draining_members_ipv4.contains(ident))
         .map(|ident| {
             let peer = peers.get_by_idx(*ident);
             FlushMember {
@@ -1046,6 +1350,7 @@ pub fn flush_done_ipv4(
     };
     group.counters.merge(&deltas);
     group.flush_inflight_ipv4 = false;
+    let waiters = std::mem::take(&mut group.drain_waiters_ipv4);
     let deferred = std::mem::take(&mut group.deferred_withdraw_ipv4);
     let rerun = std::mem::take(&mut group.flush_pending_ipv4);
     let members = group.members.clone();
@@ -1071,6 +1376,13 @@ pub fn flush_done_ipv4(
     }
     if rerun {
         flush_ipv4(update_groups, peers, tx, id, interface_addrs);
+    }
+    // Resolve the ownership fence only after every packet belonging to the
+    // old owner, including parked withdraws, has reached the writer queue.
+    for replies in waiters.into_values() {
+        for reply in replies {
+            let _ = reply.send(());
+        }
     }
 }
 
@@ -1175,7 +1487,18 @@ pub fn send_ipv6(
         .entry(attr.clone())
         .or_default()
         .insert(nlri.clone(), source_ident);
-    group.cache_ipv6_rev.insert(nlri, attr);
+    group.cache_ipv6_rev.insert(nlri.clone(), attr);
+    let excluded = group.cache_ipv6_excluded.entry(nlri.clone()).or_default();
+    for member in &group.members {
+        if group.draining_members_ipv6.contains(member) {
+            excluded.insert(*member);
+        } else {
+            excluded.remove(member);
+        }
+    }
+    if excluded.is_empty() {
+        group.cache_ipv6_excluded.remove(&nlri);
+    }
     if kick_timer && group.cache_ipv6_timer.is_none() {
         let secs = group.adv_interval.secs_for(group.sig.peer_type);
         group.cache_ipv6_timer = Some(start_adv_timer_ipv6(tx, &group.id, secs));
@@ -1193,6 +1516,23 @@ pub fn cache_remove_ipv6(group: &mut UpdateGroup, prefix: ipnet::Ipv6Net, id: u3
         if bucket.is_empty() {
             group.cache_ipv6.remove(&attr);
         }
+    }
+    group.cache_ipv6_excluded.remove(&nlri);
+}
+
+pub fn cache_exclude_ipv6(
+    group: &mut UpdateGroup,
+    prefix: ipnet::Ipv6Net,
+    id: u32,
+    peer_idx: usize,
+) {
+    let nlri = Ipv6Nlri { id, prefix };
+    if group.cache_ipv6_rev.contains_key(&nlri) {
+        group
+            .cache_ipv6_excluded
+            .entry(nlri)
+            .or_default()
+            .insert(peer_idx);
     }
 }
 
@@ -1217,10 +1557,20 @@ pub(super) fn build_flush_job_ipv6(
 ) -> Option<FlushJob<Ipv6Nlri>> {
     let afi_safi = AfiSafi::new(Afi::Ip6, Safi::Unicast);
     group.cache_ipv6_timer = None;
-    let buckets: Vec<(Arc<BgpAttr>, Vec<(Ipv6Nlri, usize)>)> = group
+    let excluded = std::mem::take(&mut group.cache_ipv6_excluded);
+    let buckets: Vec<(Arc<BgpAttr>, Vec<(Ipv6Nlri, usize, BTreeSet<usize>)>)> = group
         .cache_ipv6
         .drain()
-        .map(|(attr, set)| (attr, set.into_iter().collect()))
+        .map(|(attr, set)| {
+            let entries = set
+                .into_iter()
+                .map(|(nlri, source)| {
+                    let suppressed = excluded.get(&nlri).cloned().unwrap_or_default();
+                    (nlri, source, suppressed)
+                })
+                .collect();
+            (attr, entries)
+        })
         .collect();
     group.cache_ipv6_rev.clear();
     if buckets.is_empty() {
@@ -1234,6 +1584,7 @@ pub(super) fn build_flush_job_ipv6(
     let members: Vec<FlushMember> = group
         .members
         .iter()
+        .filter(|ident| !group.draining_members_ipv6.contains(ident))
         .map(|ident| {
             let peer = peers.get_by_idx(*ident);
             FlushMember {
@@ -1302,6 +1653,7 @@ pub fn flush_done_ipv6(
     };
     group.counters.merge(&deltas);
     group.flush_inflight_ipv6 = false;
+    let waiters = std::mem::take(&mut group.drain_waiters_ipv6);
     let deferred = std::mem::take(&mut group.deferred_withdraw_ipv6);
     let rerun = std::mem::take(&mut group.flush_pending_ipv6);
     let members = group.members.clone();
@@ -1319,6 +1671,11 @@ pub fn flush_done_ipv6(
     }
     if rerun {
         flush_ipv6(update_groups, peers, tx, id);
+    }
+    for replies in waiters.into_values() {
+        for reply in replies {
+            let _ = reply.send(());
+        }
     }
 }
 
@@ -1790,8 +2147,9 @@ mod tests {
 
         let mut groups = empty_map();
         let rid = "1.1.1.1".parse().unwrap();
-        attach(&mut groups, &mut peers, dual_idx, rid, true);
-        attach(&mut groups, &mut peers, v4only_idx, rid, true);
+        let addrs = super::super::interface_addrs::InterfaceAddrs::default();
+        attach(&mut groups, &mut peers, dual_idx, rid, true, &addrs);
+        attach(&mut groups, &mut peers, v4only_idx, rid, true, &addrs);
 
         let v4_key = AfiSafi::new(Afi::Ip, Safi::Unicast);
         let v6_key = AfiSafi::new(Afi::Ip6, Safi::Unicast);
@@ -1831,6 +2189,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn attach_for_v4_handoff_installs_map_membership_but_not_task_member() {
+        let addr: IpAddr = std::net::Ipv4Addr::new(10, 0, 0, 44).into();
+        let mut peer = attach_test_peer(addr);
+        negotiate(&mut peer, Afi::Ip, Safi::Unicast);
+        let sig = signature_of(&peer, Afi::Ip, Safi::Unicast).unwrap();
+        let mut peers = PeerMap::new();
+        peers.insert(addr, peer);
+        let peer_idx = peers.get(&addr).unwrap().ident;
+
+        let (id, mut group) = test_group(0);
+        group.sig = sig;
+        group.task = Some(super::super::group_egress::GroupEgressTask::spawn(
+            id.clone(),
+        ));
+        let mut groups = groups_with(group);
+        attach_for_v4_handoff(
+            &mut groups,
+            &mut peers,
+            peer_idx,
+            std::net::Ipv4Addr::new(1, 1, 1, 1),
+            true,
+            &super::super::interface_addrs::InterfaceAddrs::default(),
+        );
+
+        let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let group = groups.get(&afi_safi).unwrap().group_by_id(&id).unwrap();
+        assert!(group.members.contains(&peer_idx));
+        assert_eq!(
+            peers.get_by_idx(peer_idx).unwrap().update_group_id[&afi_safi],
+            id
+        );
+        let (reply, count) = tokio::sync::oneshot::channel();
+        group
+            .task
+            .as_ref()
+            .unwrap()
+            .send(super::super::group_egress::GroupEgressDeltaV4::CountMembers { reply });
+        assert_eq!(count.await.unwrap(), 0);
+    }
+
     /// The counter-bump path uses `group_by_id_mut` to find the
     /// group from a peer's back-reference id. Verifies the lookup
     /// finds the group and that mutating the returned reference
@@ -1850,17 +2249,23 @@ mod tests {
                 counters: UpdateGroupCounters::default(),
                 cache_ipv4: HashMap::new(),
                 cache_ipv4_rev: HashMap::new(),
+                cache_ipv4_excluded: HashMap::new(),
                 cache_ipv4_timer: None,
                 cache_ipv6: HashMap::new(),
                 cache_ipv6_rev: HashMap::new(),
+                cache_ipv6_excluded: HashMap::new(),
                 cache_ipv6_timer: None,
                 adv_interval: AdvInterval::default(),
                 flush_inflight_ipv4: false,
                 flush_pending_ipv4: false,
                 deferred_withdraw_ipv4: Vec::new(),
+                draining_members_ipv4: BTreeSet::new(),
+                drain_waiters_ipv4: BTreeMap::new(),
                 flush_inflight_ipv6: false,
                 flush_pending_ipv6: false,
                 deferred_withdraw_ipv6: Vec::new(),
+                draining_members_ipv6: BTreeSet::new(),
+                drain_waiters_ipv6: BTreeMap::new(),
                 task: None,
             },
         );
@@ -1983,6 +2388,10 @@ mod tests {
         }
     }
 
+    fn pending<N>(nlri: N, source: usize) -> (N, usize, BTreeSet<usize>) {
+        (nlri, source, BTreeSet::new())
+    }
+
     fn flush_member(ident: usize) -> (FlushMember, mpsc::UnboundedReceiver<bytes::BytesMut>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
@@ -2009,7 +2418,10 @@ mod tests {
     #[test]
     fn flush_job_canonical_shared_bytes() {
         let attr = test_attr(0);
-        let entries = vec![(nlri("10.0.0.1/32"), 99), (nlri("10.0.0.2/32"), 99)];
+        let entries = vec![
+            pending(nlri("10.0.0.1/32"), 99),
+            pending(nlri("10.0.0.2/32"), 99),
+        ];
         let (m1, mut rx1) = flush_member(1);
         let (m2, mut rx2) = flush_member(2);
         let job = FlushJob {
@@ -2021,7 +2433,7 @@ mod tests {
         };
         let counters = job.run();
 
-        let nlris: Vec<Ipv4Nlri> = entries.iter().map(|(n, _)| n.clone()).collect();
+        let nlris: Vec<Ipv4Nlri> = entries.iter().map(|(n, _, _)| n.clone()).collect();
         let golden = encode_ipv4_update(&attr, &nlris, bgp_packet::BGP_PACKET_LEN, true, None);
         assert!(!golden.is_empty());
         assert_eq!(recv_all(&mut rx1), golden);
@@ -2043,7 +2455,10 @@ mod tests {
     #[test]
     fn flush_job_split_horizon_prunes_source() {
         let attr = test_attr(0);
-        let entries = vec![(nlri("10.0.0.1/32"), 1), (nlri("10.0.0.2/32"), 7)];
+        let entries = vec![
+            pending(nlri("10.0.0.1/32"), 1),
+            pending(nlri("10.0.0.2/32"), 7),
+        ];
         let (m1, mut rx1) = flush_member(1);
         let (m2, mut rx2) = flush_member(2);
         let job = FlushJob {
@@ -2097,7 +2512,7 @@ mod tests {
         let (incapable, mut rx_no) = flush_member(2);
 
         let job = FlushJob {
-            buckets: vec![(attr.clone(), vec![(nlri("10.0.0.1/32"), 99)])],
+            buckets: vec![(attr.clone(), vec![pending(nlri("10.0.0.1/32"), 99)])],
             members: vec![capable, incapable],
             as4: true,
             max_packet_size: bgp_packet::BGP_PACKET_LEN,
@@ -2128,7 +2543,7 @@ mod tests {
         };
         let (m3, mut rx3) = flush_member(3); // no link-local yet → skipped
 
-        let entries = vec![(nlri("10.0.0.1/32"), 99)];
+        let entries = vec![pending(nlri("10.0.0.1/32"), 99)];
         let job = FlushJob {
             buckets: vec![(attr.clone(), entries.clone())],
             members: vec![m1, m2, m3],
@@ -2138,7 +2553,7 @@ mod tests {
         };
         let counters = job.run();
 
-        let nlris: Vec<Ipv4Nlri> = entries.iter().map(|(n, _)| n.clone()).collect();
+        let nlris: Vec<Ipv4Nlri> = entries.iter().map(|(n, _, _)| n.clone()).collect();
         let golden1 =
             encode_ipv4_update(&attr, &nlris, bgp_packet::BGP_PACKET_LEN, true, Some(nh1));
         let golden2 =
@@ -2163,7 +2578,7 @@ mod tests {
         attr.aspath = Some(As4Path::from(vec![65001]));
         attr.nexthop = Some(BgpNexthop::Ipv6("2001:db8::1".parse().unwrap()));
         let attr = Arc::new(attr);
-        let entries = vec![(
+        let entries = vec![pending(
             Ipv6Nlri {
                 id: 0,
                 prefix: "2001:db8:1::/48".parse().unwrap(),
@@ -2179,7 +2594,7 @@ mod tests {
             enhe: false,
         };
         let counters = job.run();
-        let nlris: Vec<Ipv6Nlri> = entries.iter().map(|(n, _)| n.clone()).collect();
+        let nlris: Vec<Ipv6Nlri> = entries.iter().map(|(n, _, _)| n.clone()).collect();
         let golden = encode_ipv6_update(&attr, &nlris, bgp_packet::BGP_PACKET_LEN, true);
         assert_eq!(recv_all(&mut rx1), golden);
         assert_eq!(counters.messages_formatted, golden.len() as u64);
@@ -2199,17 +2614,23 @@ mod tests {
             counters: UpdateGroupCounters::default(),
             cache_ipv4: HashMap::new(),
             cache_ipv4_rev: HashMap::new(),
+            cache_ipv4_excluded: HashMap::new(),
             cache_ipv4_timer: None,
             cache_ipv6: HashMap::new(),
             cache_ipv6_rev: HashMap::new(),
+            cache_ipv6_excluded: HashMap::new(),
             cache_ipv6_timer: None,
             adv_interval: AdvInterval::default(),
             flush_inflight_ipv4: false,
             flush_pending_ipv4: false,
             deferred_withdraw_ipv4: Vec::new(),
+            draining_members_ipv4: BTreeSet::new(),
+            drain_waiters_ipv4: BTreeMap::new(),
             flush_inflight_ipv6: false,
             flush_pending_ipv6: false,
             deferred_withdraw_ipv6: Vec::new(),
+            draining_members_ipv6: BTreeSet::new(),
+            drain_waiters_ipv6: BTreeMap::new(),
             task: None,
         };
         (id, group)
@@ -2256,6 +2677,370 @@ mod tests {
             1,
             "cache must not drain while latched"
         );
+    }
+
+    #[test]
+    fn fence_member_ipv4_waits_for_inflight_and_excludes_future_flushes() {
+        let addr: IpAddr = std::net::Ipv4Addr::new(10, 0, 0, 9).into();
+        let mut peer = attach_test_peer(addr);
+        negotiate(&mut peer, Afi::Ip, Safi::Unicast);
+        let mut peers = PeerMap::new();
+        peers.insert(addr, peer);
+        let peer_idx = peers.get(&addr).unwrap().ident;
+        let mut groups = empty_map();
+        attach(
+            &mut groups,
+            &mut peers,
+            peer_idx,
+            std::net::Ipv4Addr::new(1, 1, 1, 1),
+            true,
+            &super::super::interface_addrs::InterfaceAddrs::default(),
+        );
+        let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let gid = peers.get_by_idx(peer_idx).unwrap().update_group_id[&afi_safi].clone();
+        let group = groups
+            .get_mut(&afi_safi)
+            .unwrap()
+            .group_by_id_mut(&gid)
+            .unwrap();
+        group.flush_inflight_ipv4 = true;
+
+        let mut fenced = fence_member_ipv4(&mut groups, &peers, peer_idx);
+        assert!(matches!(
+            fenced.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let group = groups
+            .get_mut(&afi_safi)
+            .unwrap()
+            .group_by_id_mut(&gid)
+            .unwrap();
+        assert!(group.draining_members_ipv4.contains(&peer_idx));
+
+        let (tx, _rx) = mpsc::channel(8);
+        let addrs = super::super::interface_addrs::InterfaceAddrs::default();
+        flush_done_ipv4(
+            &mut groups,
+            &mut peers,
+            &tx,
+            &gid,
+            UpdateGroupCounters::default(),
+            &addrs,
+        );
+        assert_eq!(fenced.try_recv(), Ok(()));
+
+        // Any cache built after the fence must omit the moving member.
+        let group = groups
+            .get_mut(&afi_safi)
+            .unwrap()
+            .group_by_id_mut(&gid)
+            .unwrap();
+        group
+            .cache_ipv4
+            .entry(test_attr(0))
+            .or_default()
+            .insert(nlri("10.0.0.1/32"), 99);
+        let job = build_flush_job_ipv4(group, &peers, &addrs).unwrap();
+        assert!(job.members.is_empty());
+    }
+
+    #[test]
+    fn fence_member_ipv6_waits_for_inflight_and_excludes_future_flushes() {
+        let addr: IpAddr = std::net::Ipv4Addr::new(10, 0, 0, 10).into();
+        let mut peer = attach_test_peer(addr);
+        negotiate(&mut peer, Afi::Ip6, Safi::Unicast);
+        let mut peers = PeerMap::new();
+        peers.insert(addr, peer);
+        let peer_idx = peers.get(&addr).unwrap().ident;
+        let mut groups = empty_map();
+        attach(
+            &mut groups,
+            &mut peers,
+            peer_idx,
+            std::net::Ipv4Addr::new(1, 1, 1, 1),
+            true,
+            &super::super::interface_addrs::InterfaceAddrs::default(),
+        );
+        let afi_safi = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+        let gid = peers.get_by_idx(peer_idx).unwrap().update_group_id[&afi_safi].clone();
+        let group = groups
+            .get_mut(&afi_safi)
+            .unwrap()
+            .group_by_id_mut(&gid)
+            .unwrap();
+        group.flush_inflight_ipv6 = true;
+
+        let mut fenced = fence_member_ipv6(&mut groups, &peers, peer_idx);
+        assert!(matches!(
+            fenced.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let group = groups
+            .get_mut(&afi_safi)
+            .unwrap()
+            .group_by_id_mut(&gid)
+            .unwrap();
+        assert!(group.draining_members_ipv6.contains(&peer_idx));
+
+        let (tx, _rx) = mpsc::channel(8);
+        flush_done_ipv6(
+            &mut groups,
+            &mut peers,
+            &tx,
+            &gid,
+            UpdateGroupCounters::default(),
+        );
+        assert_eq!(fenced.try_recv(), Ok(()));
+
+        let group = groups
+            .get_mut(&afi_safi)
+            .unwrap()
+            .group_by_id_mut(&gid)
+            .unwrap();
+        group.cache_ipv6.entry(test_attr(0)).or_default().insert(
+            Ipv6Nlri {
+                id: 0,
+                prefix: "2001:db8::/32".parse().unwrap(),
+            },
+            99,
+        );
+        let job = build_flush_job_ipv6(group, &peers).unwrap();
+        assert!(job.members.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_ipv4_is_not_resurrected_after_policy_deny_reattach() {
+        let addr1: IpAddr = std::net::Ipv4Addr::new(10, 0, 0, 21).into();
+        let addr2: IpAddr = std::net::Ipv4Addr::new(10, 0, 0, 22).into();
+        let (wire1, mut rx1) = mpsc::unbounded_channel();
+        let (wire2, mut rx2) = mpsc::unbounded_channel();
+        let mut peer1 = attach_test_peer(addr1);
+        let mut peer2 = attach_test_peer(addr2);
+        negotiate(&mut peer1, Afi::Ip, Safi::Unicast);
+        negotiate(&mut peer2, Afi::Ip, Safi::Unicast);
+        peer1.packet_tx = Some(wire1);
+        peer2.packet_tx = Some(wire2);
+        let mut peers = PeerMap::new();
+        peers.insert(addr1, peer1);
+        peers.insert(addr2, peer2);
+        let peer1 = peers.get(&addr1).unwrap().ident;
+        let peer2 = peers.get(&addr2).unwrap().ident;
+        let family = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let mut groups = empty_map();
+        for ident in [peer1, peer2] {
+            attach_family(
+                &mut groups,
+                &mut peers,
+                ident,
+                family,
+                std::net::Ipv4Addr::new(1, 1, 1, 1),
+                true,
+                &super::super::interface_addrs::InterfaceAddrs::default(),
+            );
+        }
+        let gid = peers.get_by_idx(peer1).unwrap().update_group_id[&family].clone();
+        let attr = test_attr(0);
+        let route = nlri("10.21.0.0/24");
+        let (timer_tx, _timer_rx) = mpsc::channel(1);
+        let group = groups
+            .get_mut(&family)
+            .unwrap()
+            .group_by_id_mut(&gid)
+            .unwrap();
+        send_ipv4(
+            group,
+            route.clone(),
+            attr.clone(),
+            usize::MAX,
+            &timer_tx,
+            false,
+        );
+
+        // A body edit or body delete keeps the binding name (and therefore
+        // the update-group signature) while changing the resolved policy to
+        // deny.  Reattachment to that same group must not revive the queued
+        // pre-policy advertisement; the other member still needs it.
+        fence_member_ipv4(&mut groups, &peers, peer1)
+            .await
+            .expect("idle fence completes");
+        detach_family(&mut groups, &mut peers, peer1, family);
+        attach_family(
+            &mut groups,
+            &mut peers,
+            peer1,
+            family,
+            std::net::Ipv4Addr::new(1, 1, 1, 1),
+            true,
+            &super::super::interface_addrs::InterfaceAddrs::default(),
+        );
+        let group = groups
+            .get_mut(&family)
+            .unwrap()
+            .group_by_id_mut(&gid)
+            .unwrap();
+        cache_exclude_ipv4(group, route.prefix, route.id, peer1);
+        let addrs = super::super::interface_addrs::InterfaceAddrs::default();
+        build_flush_job_ipv4(group, &peers, &addrs)
+            .expect("queued route remains for peer2")
+            .run();
+        assert!(recv_all(&mut rx1).is_empty());
+        assert!(!recv_all(&mut rx2).is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_ipv6_is_not_resurrected_after_policy_delete_reattach() {
+        let addr1: IpAddr = std::net::Ipv4Addr::new(10, 0, 0, 23).into();
+        let addr2: IpAddr = std::net::Ipv4Addr::new(10, 0, 0, 24).into();
+        let (wire1, mut rx1) = mpsc::unbounded_channel();
+        let (wire2, mut rx2) = mpsc::unbounded_channel();
+        let mut peer1 = attach_test_peer(addr1);
+        let mut peer2 = attach_test_peer(addr2);
+        negotiate(&mut peer1, Afi::Ip6, Safi::Unicast);
+        negotiate(&mut peer2, Afi::Ip6, Safi::Unicast);
+        peer1.packet_tx = Some(wire1);
+        peer2.packet_tx = Some(wire2);
+        let mut peers = PeerMap::new();
+        peers.insert(addr1, peer1);
+        peers.insert(addr2, peer2);
+        let peer1 = peers.get(&addr1).unwrap().ident;
+        let peer2 = peers.get(&addr2).unwrap().ident;
+        let family = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+        let mut groups = empty_map();
+        for ident in [peer1, peer2] {
+            attach_family(
+                &mut groups,
+                &mut peers,
+                ident,
+                family,
+                std::net::Ipv4Addr::new(1, 1, 1, 1),
+                true,
+                &super::super::interface_addrs::InterfaceAddrs::default(),
+            );
+        }
+        let gid = peers.get_by_idx(peer1).unwrap().update_group_id[&family].clone();
+        let mut attr = BgpAttr::new();
+        attr.origin = Some(Origin::Igp);
+        attr.aspath = Some(As4Path::from(vec![65001]));
+        attr.nexthop = Some(BgpNexthop::Ipv6("2001:db8::1".parse().unwrap()));
+        let route = Ipv6Nlri {
+            id: 0,
+            prefix: "2001:db8:21::/48".parse().unwrap(),
+        };
+        let (timer_tx, _timer_rx) = mpsc::channel(1);
+        let group = groups
+            .get_mut(&family)
+            .unwrap()
+            .group_by_id_mut(&gid)
+            .unwrap();
+        send_ipv6(
+            group,
+            route.clone(),
+            Arc::new(attr),
+            usize::MAX,
+            &timer_tx,
+            false,
+        );
+
+        fence_member_ipv6(&mut groups, &peers, peer1)
+            .await
+            .expect("idle fence completes");
+        detach_family(&mut groups, &mut peers, peer1, family);
+        attach_family(
+            &mut groups,
+            &mut peers,
+            peer1,
+            family,
+            std::net::Ipv4Addr::new(1, 1, 1, 1),
+            true,
+            &super::super::interface_addrs::InterfaceAddrs::default(),
+        );
+        let group = groups
+            .get_mut(&family)
+            .unwrap()
+            .group_by_id_mut(&gid)
+            .unwrap();
+        cache_exclude_ipv6(group, route.prefix, route.id, peer1);
+        build_flush_job_ipv6(group, &peers)
+            .expect("queued route remains for peer2")
+            .run();
+        assert!(recv_all(&mut rx1).is_empty());
+        assert!(!recv_all(&mut rx2).is_empty());
+    }
+
+    #[test]
+    fn family_detach_preserves_other_family_inflight_fence() {
+        let addr: IpAddr = std::net::Ipv4Addr::new(10, 0, 0, 11).into();
+        let mut peer = attach_test_peer(addr);
+        negotiate(&mut peer, Afi::Ip, Safi::Unicast);
+        negotiate(&mut peer, Afi::Ip6, Safi::Unicast);
+        let mut peers = PeerMap::new();
+        peers.insert(addr, peer);
+        let peer_idx = peers.get(&addr).unwrap().ident;
+        let mut groups = empty_map();
+        attach(
+            &mut groups,
+            &mut peers,
+            peer_idx,
+            std::net::Ipv4Addr::new(1, 1, 1, 1),
+            true,
+            &super::super::interface_addrs::InterfaceAddrs::default(),
+        );
+        let v4 = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let v6 = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+        let v4_id = peers.get_by_idx(peer_idx).unwrap().update_group_id[&v4].clone();
+        let v6_id = peers.get_by_idx(peer_idx).unwrap().update_group_id[&v6].clone();
+        groups
+            .get_mut(&v4)
+            .unwrap()
+            .group_by_id_mut(&v4_id)
+            .unwrap()
+            .flush_inflight_ipv4 = true;
+        groups
+            .get_mut(&v6)
+            .unwrap()
+            .group_by_id_mut(&v6_id)
+            .unwrap()
+            .flush_inflight_ipv6 = true;
+
+        let _v4_fence = fence_member_ipv4(&mut groups, &peers, peer_idx);
+        let mut v6_fence = fence_member_ipv6(&mut groups, &peers, peer_idx);
+        detach_family(&mut groups, &mut peers, peer_idx, v4);
+
+        assert!(matches!(
+            v6_fence.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            !peers
+                .get_by_idx(peer_idx)
+                .unwrap()
+                .update_group_id
+                .contains_key(&v4)
+        );
+        assert_eq!(
+            peers.get_by_idx(peer_idx).unwrap().update_group_id[&v6],
+            v6_id
+        );
+        assert!(
+            groups
+                .get_mut(&v6)
+                .unwrap()
+                .group_by_id_mut(&v6_id)
+                .unwrap()
+                .drain_waiters_ipv6
+                .contains_key(&peer_idx),
+            "v4 completion must not cancel v6's fence waiter"
+        );
+
+        let (tx, _rx) = mpsc::channel(8);
+        flush_done_ipv6(
+            &mut groups,
+            &mut peers,
+            &tx,
+            &v6_id,
+            UpdateGroupCounters::default(),
+        );
+        assert_eq!(v6_fence.try_recv(), Ok(()));
     }
 
     /// FlushDone merges the worker's deltas, releases the latch, and

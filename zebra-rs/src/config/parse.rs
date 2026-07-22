@@ -1279,6 +1279,7 @@ mod tests {
             "show bgp attributes",
             "show bgp link-state",
             "show bgp vrf blue neighbor",
+            "show bgp vrf blue neighbor 192.0.2.2",
             "show bgp neighbor-group g1",
         ] {
             let (code, _comps, _state) = parse(cmd, entry.clone(), None, State::new());
@@ -1573,6 +1574,16 @@ mod tests {
         let cases: Vec<(&str, &str, Vec<&str>)> = vec![
             ("show bgp vrf", "/show/bgp/vrf", vec![]),
             ("show bgp vrf blue", "/show/bgp/vrf", vec!["blue"]),
+            (
+                "show bgp vrf blue neighbor",
+                "/show/bgp/vrf/neighbor",
+                vec!["blue"],
+            ),
+            (
+                "show bgp vrf blue neighbor 192.0.2.2",
+                "/show/bgp/vrf/neighbor",
+                vec!["blue", "192.0.2.2"],
+            ),
             ("show bgp vrf blue ipv4", "/show/bgp/vrf/ipv4", vec!["blue"]),
             (
                 "show bgp vrf blue ipv4 10.0.0.1",

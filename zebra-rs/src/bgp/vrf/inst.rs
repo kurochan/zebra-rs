@@ -7,23 +7,91 @@
 //! import), and the identity (`name`, `rd`, `router_id`) the
 //! global task supplies at spawn time.
 
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
+use bgp_packet::{Afi, AfiSafi, Safi};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::config::{ConfigChannel, ShowChannel};
 use crate::context::{ProtoContext, Task};
+use crate::policy::{self, PolicyRxChannel};
 use crate::{bgp_vpn_trace, bgp_vrf_trace};
 
 use super::super::Message;
 use super::super::config::BgpRedistSource;
 use super::super::interface_addrs::InterfaceAddrs;
 use super::super::peer_map::PeerMap;
+use super::super::policy::InOut;
 use super::super::route::{LocalRib, ORIGINATED_PEER};
 use super::super::shard::BgpShard;
 use super::super::store::BgpAttrStore;
 use super::super::update_group::UpdateGroupMap;
 use super::msg::{BgpGlobalMsg, BgpVrfMsg};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PrefixSetBindingKey {
+    peer_idx: usize,
+    afi_safi: AfiSafi,
+    direction: InOut,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPrefixSetConfig {
+    address: std::net::IpAddr,
+    afi_safi: AfiSafi,
+    direction: InOut,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOutputPrefixSet {
+    token: usize,
+    /// Established-session generation whose old wire ownership is being
+    /// fenced. A completion from another generation is stale even when the
+    /// peer has already re-established by the time it is processed.
+    session_generation: u64,
+    name: Option<String>,
+    prefix_set: Option<policy::PrefixSet>,
+    reevaluate: bool,
+}
+
+#[derive(Debug)]
+enum OutputPrefixSetReady {
+    Fenced {
+        key: PrefixSetBindingKey,
+        token: usize,
+        session_generation: u64,
+    },
+    FenceFailed {
+        key: PrefixSetBindingKey,
+        token: usize,
+        session_generation: u64,
+    },
+    Extracted {
+        key: PrefixSetBindingKey,
+        token: usize,
+        session_generation: u64,
+        previous: Vec<(ipnet::Ipv4Net, super::super::route::BgpRib)>,
+    },
+    ExtractFailed {
+        key: PrefixSetBindingKey,
+        token: usize,
+        session_generation: u64,
+    },
+}
+
+#[derive(Debug)]
+enum GateOffOutputSnapshot {
+    V4 {
+        adj_out: Vec<(ipnet::Ipv4Net, super::super::route::BgpRib)>,
+        pending: Vec<bgp_packet::Ipv4Nlri>,
+    },
+    V6 {
+        adj_out: Vec<(ipnet::Ipv6Net, super::super::route::BgpRib)>,
+        pending: Vec<bgp_packet::Ipv6Nlri>,
+    },
+}
 
 /// Per-VRF BGP runtime. One task per `router bgp vrf X` block.
 pub struct BgpVrf {
@@ -83,6 +151,51 @@ pub struct BgpVrf {
     /// Show-command subscription. `show bgp vrf <name> ...`
     /// dispatches through this channel.
     pub show: ShowChannel,
+    /// Prefix-set resolution feed dedicated to this VRF. A unique policy
+    /// protocol name isolates local peer indexes from the default instance
+    /// and from every other VRF.
+    pub policy_rx: UnboundedReceiver<policy::PolicyRx>,
+    pub policy_tx: Option<UnboundedSender<policy::Message>>,
+    /// Commit-final canonical inventory received from the policy actor before
+    /// BGP's CommitEnd is dispatched.  Binding changes can therefore install
+    /// a known object atomically, while an absent name becomes unresolved and
+    /// fail-closed immediately rather than retaining the prior permit set.
+    prefix_set_inventory: std::collections::BTreeMap<String, policy::PrefixSet>,
+    prefix_set_inventory_generation: u64,
+    prefix_set_inventory_history:
+        std::collections::BTreeMap<u64, std::collections::BTreeMap<String, policy::PrefixSet>>,
+    /// Direct policy-watch updates bracketed by a policy commit start and
+    /// BGP commit end.  Deferral makes a body-edit + rebind transaction
+    /// atomic from the live peer's point of view.
+    pending_prefix_set_policy_updates: std::collections::BTreeMap<u64, Vec<policy::PolicyRx>>,
+    /// Config bindings are installed as one generation before any soft
+    /// reevaluation. This prevents an inbound permit from advertising through
+    /// another peer's old outbound policy in the middle of the same commit.
+    pending_prefix_set_config_updates: std::collections::BTreeMap<u64, Vec<PendingPrefixSetConfig>>,
+    /// Input replay waits until every asynchronous outbound ownership handoff
+    /// started by the install phase has completed.
+    deferred_input_prefix_set_replays: HashSet<PrefixSetBindingKey>,
+    /// Latest prefix-set generation whose BGP-side CommitEnd has run.  A
+    /// generation-tagged Register reply newer than this fence is queued with
+    /// that generation instead of being applied from the policy actor's
+    /// ahead-of-BGP state.
+    applied_prefix_set_policy_generation: u64,
+    receiving_prefix_set_policy_generation: Option<u64>,
+    policy_proto: String,
+    pending_output_prefix_sets: HashMap<PrefixSetBindingKey, PendingOutputPrefixSet>,
+    /// Actual wire baseline captured by the first group-task extraction.
+    /// A superseding rebind must inherit it rather than snapshotting the old
+    /// owner again after that owner has already stopped sending to the peer.
+    extracted_output_prefix_sets:
+        HashMap<PrefixSetBindingKey, Vec<(ipnet::Ipv4Net, super::super::route::BgpRib)>>,
+    extracting_output_prefix_sets: HashSet<PrefixSetBindingKey>,
+    gate_off_output_prefix_sets: HashMap<PrefixSetBindingKey, GateOffOutputSnapshot>,
+    prefix_set_watch_ids: HashMap<PrefixSetBindingKey, usize>,
+    prefix_set_watch_bindings: HashMap<usize, PrefixSetBindingKey>,
+    next_prefix_set_watch_id: usize,
+    next_output_prefix_set_token: usize,
+    output_prefix_set_tx: UnboundedSender<OutputPrefixSetReady>,
+    output_prefix_set_rx: UnboundedReceiver<OutputPrefixSetReady>,
     /// Outbound channel to the global `Bgp` task. Used for peer
     /// registration and per-VRF best-path exports.
     pub global_tx: UnboundedSender<BgpGlobalMsg>,
@@ -711,6 +824,11 @@ impl BgpVrf {
     ) -> (Self, BgpVrfInbox) {
         let (inbox_tx, global_rx) = mpsc::unbounded_channel();
         let (tx, rx) = mpsc::channel(8192);
+        let (output_prefix_set_tx, output_prefix_set_rx) = mpsc::unbounded_channel();
+        // Tests constructing BgpVrf directly need no policy actor. The real
+        // spawn path replaces this closed receiver in attach_policy_actor.
+        let (_policy_dummy_tx, policy_rx) = mpsc::unbounded_channel();
+        let policy_proto = format!("bgp:vrf:{name}");
         let vrf = Self {
             name,
             ctx,
@@ -727,6 +845,27 @@ impl BgpVrf {
             dataplane: super::super::vrf_config::MupDataplane::default(),
             cm: ConfigChannel::new(),
             show: ShowChannel::new(),
+            policy_rx,
+            policy_tx: None,
+            prefix_set_inventory: std::collections::BTreeMap::new(),
+            prefix_set_inventory_generation: 0,
+            prefix_set_inventory_history: std::collections::BTreeMap::new(),
+            pending_prefix_set_policy_updates: std::collections::BTreeMap::new(),
+            pending_prefix_set_config_updates: std::collections::BTreeMap::new(),
+            deferred_input_prefix_set_replays: HashSet::new(),
+            applied_prefix_set_policy_generation: 0,
+            receiving_prefix_set_policy_generation: None,
+            policy_proto,
+            pending_output_prefix_sets: HashMap::new(),
+            extracted_output_prefix_sets: HashMap::new(),
+            extracting_output_prefix_sets: HashSet::new(),
+            gate_off_output_prefix_sets: HashMap::new(),
+            prefix_set_watch_ids: HashMap::new(),
+            prefix_set_watch_bindings: HashMap::new(),
+            next_prefix_set_watch_id: 1,
+            next_output_prefix_set_token: 1,
+            output_prefix_set_tx,
+            output_prefix_set_rx,
             global_tx,
             global_rx,
             rib_rx,
@@ -756,6 +895,36 @@ impl BgpVrf {
             mup_gtp_encap_installed: std::collections::BTreeMap::new(),
         };
         (vrf, inbox_tx)
+    }
+
+    /// Subscribe this task under its VRF-qualified protocol identity. Must
+    /// run before materialising peers so subsequent Register messages are
+    /// FIFO-ordered behind Subscribe on the policy actor mailbox.
+    #[cfg(test)]
+    pub(super) fn attach_policy_actor(&mut self, policy_tx: UnboundedSender<policy::Message>) {
+        self.attach_policy_actor_as(policy_tx, self.policy_proto.clone());
+    }
+
+    /// Spawn path variant with a per-incarnation identity.  The stable VRF
+    /// name remains in RIB/show keys; only policy watches need this extra
+    /// generation to reject messages from an aborted predecessor task.
+    pub(super) fn attach_policy_actor_as(
+        &mut self,
+        policy_tx: UnboundedSender<policy::Message>,
+        proto: String,
+    ) {
+        let chan = PolicyRxChannel::new();
+        let _ = policy_tx.send(policy::Message::Subscribe {
+            proto: proto.clone(),
+            tx: chan.tx,
+        });
+        self.policy_proto = proto;
+        self.policy_rx = chan.rx;
+        self.policy_tx = Some(policy_tx);
+    }
+
+    fn policy_proto(&self) -> String {
+        self.policy_proto.clone()
     }
 
     /// Withdraw every controller ST route this VRF exported for `seid`: emit a
@@ -1154,6 +1323,1007 @@ impl BgpVrf {
         }
     }
 
+    fn prefix_policy_type(direction: InOut) -> policy::PolicyType {
+        match direction {
+            InOut::Input => policy::PolicyType::PrefixSetIn,
+            InOut::Output => policy::PolicyType::PrefixSetOut,
+        }
+    }
+
+    /// Bind/unbind one live peer slot. The transaction generation selects the
+    /// matching commit-final inventory; a missing snapshot or name installs
+    /// unresolved/fail-closed rather than borrowing a newer commit's object.
+    pub(super) fn bind_prefix_set(
+        &mut self,
+        address: std::net::IpAddr,
+        afi_safi: AfiSafi,
+        direction: InOut,
+        name: Option<String>,
+        reevaluate: bool,
+        inventory_generation: Option<u64>,
+    ) -> bool {
+        let Some(peer_idx) = self.peers.get(&address).map(|peer| peer.ident) else {
+            return false;
+        };
+        let key = PrefixSetBindingKey {
+            peer_idx,
+            afi_safi,
+            direction,
+        };
+        let active = self
+            .peers
+            .get_by_idx(peer_idx)
+            .and_then(|peer| peer.prefix_set.get(&afi_safi))
+            .and_then(|io| io.get(&direction).name.clone());
+        let desired = if let Some(pending) = self.pending_output_prefix_sets.get(&key) {
+            pending.name.clone()
+        } else {
+            active.clone()
+        };
+        if desired == name {
+            return false;
+        }
+
+        let policy_type = Self::prefix_policy_type(direction);
+        let old_output = self.pending_output_prefix_sets.remove(&key);
+        let old_watch_id = self.prefix_set_watch_ids.remove(&key);
+        if let Some(watch_id) = old_watch_id {
+            self.prefix_set_watch_bindings.remove(&watch_id);
+        }
+        let new_watch = name.as_ref().map(|_| {
+            let watch_id = self.next_prefix_set_watch_id;
+            self.next_prefix_set_watch_id = self.next_prefix_set_watch_id.wrapping_add(1).max(1);
+            self.prefix_set_watch_bindings.insert(watch_id, key);
+            watch_id
+        });
+        if let Some(tx) = &self.policy_tx {
+            // A pending watch supersedes the active watch: the latter was
+            // already unregistered when this rebind started.
+            if let Some(prior) = old_output
+                .as_ref()
+                .and_then(|pending| pending.name.clone())
+                .or_else(|| active.clone())
+            {
+                let _ = tx.send(policy::Message::Unregister {
+                    proto: self.policy_proto(),
+                    name: prior,
+                    ident: old_watch_id.unwrap_or(0),
+                    policy_type,
+                });
+            }
+            if let Some(name) = name.clone() {
+                let _ = tx.send(policy::Message::Register {
+                    proto: self.policy_proto(),
+                    name,
+                    ident: new_watch.expect("watch allocated for a name"),
+                    policy_type,
+                });
+            }
+        }
+
+        if let Some(watch_id) = new_watch {
+            self.prefix_set_watch_ids.insert(key, watch_id);
+        }
+
+        let prefix_set = match inventory_generation {
+            Some(generation) => self
+                .prefix_set_inventory_history
+                .get(&generation)
+                .and_then(|inventory| name.as_ref().and_then(|name| inventory.get(name)))
+                .cloned(),
+            None => name
+                .as_ref()
+                .and_then(|name| self.prefix_set_inventory.get(name))
+                .cloned(),
+        };
+        self.install_prefix_set_binding(
+            peer_idx, afi_safi, direction, name, prefix_set, reevaluate,
+        );
+        true
+    }
+
+    fn install_prefix_set_binding(
+        &mut self,
+        peer_idx: usize,
+        afi_safi: AfiSafi,
+        direction: InOut,
+        name: Option<String>,
+        prefix_set: Option<policy::PrefixSet>,
+        reevaluate: bool,
+    ) {
+        let established = self
+            .peers
+            .get_by_idx(peer_idx)
+            .is_some_and(|peer| peer.state.is_established());
+        if direction == InOut::Output
+            && established
+            && matches!(afi_safi.afi, Afi::Ip | Afi::Ip6)
+            && afi_safi.safi == Safi::Unicast
+        {
+            self.start_output_prefix_set_handoff(peer_idx, afi_safi, name, prefix_set, reevaluate);
+            return;
+        }
+
+        self.apply_prefix_set_binding(peer_idx, afi_safi, direction, name, prefix_set);
+        if reevaluate {
+            self.reapply_prefix_set(peer_idx, afi_safi, direction);
+        }
+    }
+
+    fn apply_prefix_set_binding(
+        &mut self,
+        peer_idx: usize,
+        afi_safi: AfiSafi,
+        direction: InOut,
+        name: Option<String>,
+        prefix_set: Option<policy::PrefixSet>,
+    ) {
+        let peer = self.peers.get_mut_by_idx(peer_idx).expect("peer exists");
+        let slot = peer.prefix_set_slot(afi_safi, direction);
+        slot.name = name;
+        slot.prefix_set = prefix_set;
+        if direction == InOut::Output {
+            peer.rebuild_out_policy();
+        }
+        if direction == InOut::Input && afi_safi == AfiSafi::new(Afi::Ip, Safi::Unicast) {
+            self.replace_shard_in_policy(peer_idx);
+        }
+    }
+
+    /// Transfer outbound ownership before changing the signature.  The
+    /// continuation runs on this VRF's event loop: awaiting an update-group
+    /// worker from inside the loop would deadlock because the same loop must
+    /// consume `FlushDone*` and release the fence.
+    fn start_output_prefix_set_handoff(
+        &mut self,
+        peer_idx: usize,
+        afi_safi: AfiSafi,
+        name: Option<String>,
+        prefix_set: Option<policy::PrefixSet>,
+        reevaluate: bool,
+    ) {
+        let key = PrefixSetBindingKey {
+            peer_idx,
+            afi_safi,
+            direction: InOut::Output,
+        };
+        if let Some(peer) = self.peers.get_mut_by_idx(peer_idx) {
+            peer.output_handoff_fenced.insert(afi_safi);
+        }
+        let token = self.next_output_prefix_set_token;
+        self.next_output_prefix_set_token =
+            self.next_output_prefix_set_token.wrapping_add(1).max(1);
+        let session_generation = self
+            .peers
+            .get_by_idx(peer_idx)
+            .map_or(0, |peer| peer.session_generation);
+        self.pending_output_prefix_sets.insert(
+            key,
+            PendingOutputPrefixSet {
+                token,
+                session_generation,
+                name,
+                prefix_set,
+                reevaluate,
+            },
+        );
+
+        if afi_safi == AfiSafi::new(Afi::Ip, Safi::Unicast)
+            && super::super::group_egress::egress_group_task_enabled()
+        {
+            if let Some(previous) = self.extracted_output_prefix_sets.remove(&key) {
+                let _ = self
+                    .output_prefix_set_tx
+                    .send(OutputPrefixSetReady::Extracted {
+                        key,
+                        token,
+                        session_generation,
+                        previous,
+                    });
+                return;
+            }
+            // A superseding rebind shares the first extraction. Starting a
+            // second one would snapshot owner state produced after this peer
+            // was removed, which is not the peer's actual wire baseline.
+            if self.extracting_output_prefix_sets.contains(&key) {
+                return;
+            }
+            let task = self
+                .peers
+                .get_by_idx(peer_idx)
+                .and_then(|peer| peer.update_group_id.get(&afi_safi))
+                .and_then(|id| self.update_groups.get(&afi_safi)?.group_by_id(id))
+                .and_then(|group| group.task.as_ref());
+            if let Some(task) = task {
+                self.extracting_output_prefix_sets.insert(key);
+                let rx = task.extract_member(peer_idx);
+                let tx = self.output_prefix_set_tx.clone();
+                tokio::spawn(async move {
+                    let ready = match rx.await {
+                        Ok(previous) => OutputPrefixSetReady::Extracted {
+                            key,
+                            token,
+                            session_generation,
+                            previous,
+                        },
+                        Err(_) => OutputPrefixSetReady::ExtractFailed {
+                            key,
+                            token,
+                            session_generation,
+                        },
+                    };
+                    let _ = tx.send(ready);
+                });
+                return;
+            }
+        }
+
+        if !self.gate_off_output_prefix_sets.contains_key(&key)
+            && let Some(snapshot) = self.snapshot_gate_off_output(peer_idx, afi_safi)
+        {
+            self.gate_off_output_prefix_sets.insert(key, snapshot);
+        }
+
+        self.wait_output_prefix_set_fence(key, token, session_generation);
+    }
+
+    fn wait_output_prefix_set_fence(
+        &mut self,
+        key: PrefixSetBindingKey,
+        token: usize,
+        session_generation: u64,
+    ) {
+        let rx = if key.afi_safi == AfiSafi::new(Afi::Ip6, Safi::Unicast) {
+            super::super::update_group::fence_member_ipv6(
+                &mut self.update_groups,
+                &self.peers,
+                key.peer_idx,
+            )
+        } else {
+            super::super::update_group::fence_member_ipv4(
+                &mut self.update_groups,
+                &self.peers,
+                key.peer_idx,
+            )
+        };
+        let tx = self.output_prefix_set_tx.clone();
+        tokio::spawn(async move {
+            let ready = match rx.await {
+                Ok(()) => OutputPrefixSetReady::Fenced {
+                    key,
+                    token,
+                    session_generation,
+                },
+                Err(_) => OutputPrefixSetReady::FenceFailed {
+                    key,
+                    token,
+                    session_generation,
+                },
+            };
+            let _ = tx.send(ready);
+        });
+    }
+
+    fn snapshot_gate_off_output(
+        &self,
+        peer_idx: usize,
+        afi_safi: AfiSafi,
+    ) -> Option<GateOffOutputSnapshot> {
+        let peer = self.peers.get_by_idx(peer_idx)?;
+        let group = peer
+            .update_group_id
+            .get(&afi_safi)
+            .and_then(|id| self.update_groups.get(&afi_safi)?.group_by_id(id));
+        if afi_safi == AfiSafi::new(Afi::Ip, Safi::Unicast) {
+            let add_path = peer.opt.is_add_path_send(Afi::Ip, Safi::Unicast);
+            let adj_out = peer
+                .adj_out
+                .v4
+                .0
+                .iter()
+                .flat_map(|(prefix, rows)| rows.iter().cloned().map(|rib| (*prefix, rib)))
+                .collect();
+            let mut pending = Vec::new();
+            if let Some(group) = group {
+                for entries in group.cache_ipv4.values() {
+                    for (nlri, source) in entries {
+                        let present = peer.adj_out.v4.0.get(&nlri.prefix).is_some_and(|rows| {
+                            !add_path || rows.iter().any(|rib| rib.local_id == nlri.id)
+                        });
+                        if *source != peer_idx && present {
+                            pending.push(nlri.clone());
+                        }
+                    }
+                }
+            }
+            Some(GateOffOutputSnapshot::V4 { adj_out, pending })
+        } else if afi_safi == AfiSafi::new(Afi::Ip6, Safi::Unicast) {
+            let add_path = peer.opt.is_add_path_send(Afi::Ip6, Safi::Unicast);
+            let adj_out = peer
+                .adj_out
+                .v6
+                .0
+                .iter()
+                .flat_map(|(prefix, rows)| rows.iter().cloned().map(|rib| (*prefix, rib)))
+                .collect();
+            let mut pending = Vec::new();
+            if let Some(group) = group {
+                for entries in group.cache_ipv6.values() {
+                    for (nlri, source) in entries {
+                        let present = peer.adj_out.v6.0.get(&nlri.prefix).is_some_and(|rows| {
+                            !add_path || rows.iter().any(|rib| rib.local_id == nlri.id)
+                        });
+                        if *source != peer_idx && present {
+                            pending.push(nlri.clone());
+                        }
+                    }
+                }
+            }
+            Some(GateOffOutputSnapshot::V6 { adj_out, pending })
+        } else {
+            None
+        }
+    }
+
+    fn restore_gate_off_output(&mut self, key: PrefixSetBindingKey) {
+        let Some(snapshot) = self.gate_off_output_prefix_sets.remove(&key) else {
+            return;
+        };
+        match snapshot {
+            GateOffOutputSnapshot::V4 { adj_out, pending } => {
+                if let Some(peer) = self.peers.get_mut_by_idx(key.peer_idx) {
+                    peer.adj_out.v4.0.clear();
+                    for (prefix, rib) in adj_out {
+                        peer.adj_out.v4.add(prefix, rib);
+                    }
+                    // A group-cache entry is optimistic Adj-RIB-Out state,
+                    // not proof that this member received the advertisement.
+                    // The fence excluded the member from that cache flush.
+                    // Establish a known-absent wire baseline (a redundant
+                    // withdraw is harmless), then let the new-policy diff
+                    // advertise only entries it still permits.
+                    for nlri in pending {
+                        super::super::route::route_withdraw_ipv4(peer, None, nlri.prefix, nlri.id);
+                        peer.adj_out.v4.remove(nlri.prefix, nlri.id);
+                    }
+                }
+            }
+            GateOffOutputSnapshot::V6 { adj_out, pending } => {
+                if let Some(peer) = self.peers.get_mut_by_idx(key.peer_idx) {
+                    peer.adj_out.v6.0.clear();
+                    for (prefix, rib) in adj_out {
+                        peer.adj_out.v6.add(prefix, rib);
+                    }
+                    for nlri in pending {
+                        super::super::route::route_withdraw_ipv6(peer, nlri.prefix, nlri.id);
+                        peer.adj_out.v6.remove(nlri.prefix, nlri.id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn replace_shard_in_policy(&mut self, peer_idx: usize) {
+        let Some(peer) = self.peers.get_by_idx(peer_idx) else {
+            return;
+        };
+        let v4u = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        self.shard.set_in_policy(
+            peer_idx,
+            Some(std::sync::Arc::new(super::super::shard::InPolicy {
+                prefix_set: peer.prefix_set_at(v4u, InOut::Input).clone(),
+                policy_list: peer.policy_list_at(v4u, InOut::Input).clone(),
+            })),
+        );
+    }
+
+    fn process_output_prefix_set_ready(&mut self, ready: OutputPrefixSetReady) {
+        let (key, token, session_generation, mut previous, extract_failed, fence_failed) =
+            match ready {
+                OutputPrefixSetReady::Fenced {
+                    key,
+                    token,
+                    session_generation,
+                } => (key, token, session_generation, None, false, false),
+                OutputPrefixSetReady::FenceFailed {
+                    key,
+                    token,
+                    session_generation,
+                } => (key, token, session_generation, None, false, true),
+                OutputPrefixSetReady::Extracted {
+                    key,
+                    token,
+                    session_generation,
+                    previous,
+                } => (key, token, session_generation, Some(previous), false, false),
+                OutputPrefixSetReady::ExtractFailed {
+                    key,
+                    token,
+                    session_generation,
+                } => (key, token, session_generation, None, true, false),
+            };
+        let Some(pending) = self.pending_output_prefix_sets.get(&key) else {
+            // The request completed or was cancelled on session-down. A late
+            // extraction is tied to that old request/session and must not be
+            // retained as the baseline of some future handoff.
+            self.extracting_output_prefix_sets.remove(&key);
+            self.gate_off_output_prefix_sets.remove(&key);
+            self.extracted_output_prefix_sets.remove(&key);
+            return;
+        };
+        if pending.token != token {
+            // A completion from an older TCP session can never supply the
+            // wire baseline for a continuation started after reconnect.
+            if pending.session_generation != session_generation {
+                return;
+            }
+            // A superseding request in the same session deliberately shared
+            // this extraction; it may now start another only after this
+            // completion is handed forward.
+            if let Some(previous) = previous {
+                // Hand the *same first* baseline to the newest continuation.
+                // Requeueing also serializes callback reordering: no second
+                // extraction exists whose later snapshot could win a race.
+                let _ = self
+                    .output_prefix_set_tx
+                    .send(OutputPrefixSetReady::Extracted {
+                        key,
+                        token: pending.token,
+                        session_generation,
+                        previous,
+                    });
+            } else if extract_failed {
+                // A newer request deliberately shared this extraction. If the
+                // old task vanished, advance that newest request through the
+                // same failed-owner recovery instead of leaving it pending
+                // forever. Gate-off Fenced callbacks never take this branch.
+                let _ = self
+                    .output_prefix_set_tx
+                    .send(OutputPrefixSetReady::ExtractFailed {
+                        key,
+                        token: pending.token,
+                        session_generation,
+                    });
+            }
+            return;
+        }
+        // Also clear on Fenced/failed extraction: leaving the latch set would
+        // suppress every later attempt for this binding. Gate-off never
+        // inserts the latch.
+        self.extracting_output_prefix_sets.remove(&key);
+        let current_generation = self
+            .peers
+            .get_by_idx(key.peer_idx)
+            .map_or(0, |peer| peer.session_generation);
+        if current_generation != session_generation
+            && self
+                .peers
+                .get_by_idx(key.peer_idx)
+                .is_some_and(|peer| peer.state.is_established())
+        {
+            // The old fence/extraction belongs to a dead socket. Discard all
+            // of its optimistic state and start a fresh transfer against the
+            // new session. This also ensures a sync that raced ahead under
+            // the old policy is corrected by the normal handoff diff.
+            let pending = pending.clone();
+            self.gate_off_output_prefix_sets.remove(&key);
+            self.extracted_output_prefix_sets.remove(&key);
+            self.extracting_output_prefix_sets.remove(&key);
+            self.start_output_prefix_set_handoff(
+                key.peer_idx,
+                key.afi_safi,
+                pending.name,
+                pending.prefix_set,
+                pending.reevaluate,
+            );
+            return;
+        }
+        if fence_failed
+            && self
+                .peers
+                .get_by_idx(key.peer_idx)
+                .is_some_and(|peer| peer.state.is_established())
+        {
+            // A family membership change or teardown can drop the old
+            // waiter's sender. It is not a fence acknowledgement: retry
+            // against the peer's current owner before changing policy.
+            self.wait_output_prefix_set_fence(key, token, session_generation);
+            return;
+        }
+        if previous.is_some()
+            && let Some(first_baseline) = self.extracted_output_prefix_sets.remove(&key)
+        {
+            previous = Some(first_baseline);
+        }
+        let pending = self
+            .pending_output_prefix_sets
+            .remove(&key)
+            .expect("validated above");
+        if self.peers.get_by_idx(key.peer_idx).is_none() {
+            self.gate_off_output_prefix_sets.remove(&key);
+            self.extracted_output_prefix_sets.remove(&key);
+            self.replay_deferred_input_prefix_sets_if_ready();
+            return;
+        }
+        let established = self
+            .peers
+            .get_by_idx(key.peer_idx)
+            .is_some_and(|peer| peer.state.is_established());
+        if !established {
+            self.gate_off_output_prefix_sets.remove(&key);
+            self.extracted_output_prefix_sets.remove(&key);
+            if let Some(peer) = self.peers.get_mut_by_idx(key.peer_idx) {
+                peer.output_handoff_fenced.remove(&key.afi_safi);
+                peer.pending_route_refresh.remove(&key.afi_safi);
+            }
+            self.apply_prefix_set_binding(
+                key.peer_idx,
+                key.afi_safi,
+                InOut::Output,
+                pending.name,
+                pending.prefix_set,
+            );
+            self.replay_deferred_input_prefix_sets_if_ready();
+            return;
+        }
+
+        // The fence guarantees every older in-flight packet is queued. Bring
+        // only its pre-fence pending-cache rows to the same point, then roll
+        // optimistic Adj-RIB-Out back to the fence-time wire baseline. Route
+        // mutations while draining were never sent; the ordinary diff below
+        // will therefore emit exactly those changes, without duplicates.
+        self.restore_gate_off_output(key);
+
+        super::super::update_group::detach_family(
+            &mut self.update_groups,
+            &mut self.peers,
+            key.peer_idx,
+            key.afi_safi,
+        );
+        self.apply_prefix_set_binding(
+            key.peer_idx,
+            key.afi_safi,
+            InOut::Output,
+            pending.name,
+            pending.prefix_set,
+        );
+
+        if let Some(previous) = previous {
+            super::super::update_group::attach_for_v4_handoff(
+                &mut self.update_groups,
+                &mut self.peers,
+                key.peer_idx,
+                self.router_id,
+                true,
+                &self.interface_addrs,
+            );
+            let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
+            let handoff = self.peers.get_by_idx(key.peer_idx).and_then(|peer| {
+                let id = peer.update_group_id.get(&afi_safi)?;
+                let task = self
+                    .update_groups
+                    .get(&afi_safi)?
+                    .group_by_id(id)?
+                    .task
+                    .as_ref()?;
+                Some((
+                    task.delta_tx(),
+                    peer.sync_ctx(self.router_id, true),
+                    peer.opt.is_add_path_send(Afi::Ip, Safi::Unicast),
+                    peer.is_enhe_v4_negotiated()
+                        .then(|| {
+                            super::super::update_group::compose_enhe_next_hop(
+                                peer,
+                                &self.interface_addrs,
+                            )
+                        })
+                        .flatten(),
+                ))
+            });
+            if let Some((task_tx, ctx, add_path, enhe_v6)) = handoff {
+                let (finish_tx, _finish_rx) = tokio::sync::oneshot::channel();
+                let _ = task_tx.send(
+                    super::super::group_egress::GroupEgressDeltaV4::BeginMemberHandoff {
+                        ident: key.peer_idx,
+                        ctx: Box::new(ctx),
+                        add_path,
+                        enhe_v6,
+                        previous,
+                    },
+                );
+                // Replaying while pending rebuilds the new owner's desired
+                // Adj-RIB-Out without exposing this peer to group fan-out.
+                self.reapply_prefix_set_handoff(key.peer_idx, key.afi_safi, InOut::Output);
+                let _ = task_tx.send(
+                    super::super::group_egress::GroupEgressDeltaV4::FinishMemberHandoff {
+                        ident: key.peer_idx,
+                        reply: finish_tx,
+                    },
+                );
+                // `task_tx` is FIFO: every replay generated below is queued
+                // after Finish, so it observes the new owner and policy.
+                self.finish_output_prefix_set_handoff(key.peer_idx, key.afi_safi);
+                return;
+            }
+            // The peer/group disappeared between extraction and install.
+            // A normal attach is the safe recovery; a later session sync
+            // reconstructs the wire state.
+            super::super::update_group::detach_family(
+                &mut self.update_groups,
+                &mut self.peers,
+                key.peer_idx,
+                key.afi_safi,
+            );
+        }
+
+        super::super::update_group::attach_family(
+            &mut self.update_groups,
+            &mut self.peers,
+            key.peer_idx,
+            key.afi_safi,
+            self.router_id,
+            true,
+            &self.interface_addrs,
+        );
+        // Every established outbound signature change requires a diff even
+        // when the caller was materializing config rather than requesting an
+        // explicit soft-out.
+        let _ = pending.reevaluate;
+        self.reapply_prefix_set_handoff(key.peer_idx, key.afi_safi, InOut::Output);
+        self.finish_output_prefix_set_handoff(key.peer_idx, key.afi_safi);
+    }
+
+    fn finish_output_prefix_set_handoff(&mut self, peer_idx: usize, afi_safi: AfiSafi) {
+        let replay_refresh = self
+            .peers
+            .get_mut_by_idx(peer_idx)
+            .map(|peer| {
+                peer.output_handoff_fenced.remove(&afi_safi);
+                peer.pending_route_refresh.remove(&afi_safi)
+            })
+            .unwrap_or(false);
+        if replay_refresh {
+            let family = match afi_safi {
+                AfiSafi {
+                    afi: Afi::Ip,
+                    safi: Safi::Unicast,
+                } => Some((1, 1)),
+                AfiSafi {
+                    afi: Afi::Ip6,
+                    safi: Safi::Unicast,
+                } => Some((2, 1)),
+                _ => None,
+            };
+            if let Some((afi, safi)) = family {
+                let exporter = self.exporter();
+                let mut top = super::super::peer::BgpTop {
+                    router_id: &self.router_id,
+                    srv6_ipv6_export: None,
+                    local_rib: &mut self.local_rib,
+                    shard: &mut self.shard,
+                    tx: &self.tx,
+                    rib_client: &self.ctx.rib,
+                    attr_store: &mut self.attr_store,
+                    update_groups: &mut self.update_groups,
+                    interface_addrs: &self.interface_addrs,
+                    vrf_export: Some(&exporter),
+                    color_policy: Some(&self.color_policy),
+                    flex_algo_routes: None,
+                    flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
+                    vrf_import: None,
+                    nexthop_cache: None,
+                    vrf_transport_v4: Some(&self.transport_v4),
+                    vrf_transport_v6: Some(&self.transport_v6),
+                    central_label_alloc: None,
+                    as_sets_withdraw: true,
+                };
+                super::super::route::route_refresh_peer(
+                    peer_idx,
+                    afi,
+                    safi,
+                    &mut top,
+                    &mut self.peers,
+                );
+            }
+        }
+        self.replay_deferred_input_prefix_sets_if_ready();
+    }
+
+    /// A session-down invalidates every outbound wire snapshot for that peer.
+    /// Install the queued policy while disconnected, before a later FSM event
+    /// can enter Established and run session-up route sync.
+    fn apply_disconnected_output_prefix_sets(&mut self, peer_idx: usize) {
+        let keys: Vec<_> = self
+            .pending_output_prefix_sets
+            .keys()
+            .filter(|key| key.peer_idx == peer_idx)
+            .copied()
+            .collect();
+        for key in keys {
+            let Some(pending) = self.pending_output_prefix_sets.remove(&key) else {
+                continue;
+            };
+            self.gate_off_output_prefix_sets.remove(&key);
+            self.extracted_output_prefix_sets.remove(&key);
+            self.extracting_output_prefix_sets.remove(&key);
+            if let Some(peer) = self.peers.get_mut_by_idx(peer_idx) {
+                peer.output_handoff_fenced.remove(&key.afi_safi);
+                peer.pending_route_refresh.remove(&key.afi_safi);
+            }
+            self.apply_prefix_set_binding(
+                peer_idx,
+                key.afi_safi,
+                InOut::Output,
+                pending.name,
+                pending.prefix_set,
+            );
+        }
+        self.replay_deferred_input_prefix_sets_if_ready();
+    }
+
+    fn process_policy_msg(&mut self, msg: policy::PolicyRx) {
+        match msg {
+            policy::PolicyRx::PrefixSetCommitStart { generation } => {
+                if generation >= self.prefix_set_inventory_generation {
+                    self.pending_prefix_set_policy_updates
+                        .entry(generation)
+                        .or_default();
+                    self.receiving_prefix_set_policy_generation = Some(generation);
+                }
+                return;
+            }
+            policy::PolicyRx::PrefixSet { generation, .. } => {
+                if generation > self.applied_prefix_set_policy_generation {
+                    self.pending_prefix_set_policy_updates
+                        .entry(generation)
+                        .or_default()
+                        .push(msg);
+                    return;
+                }
+                // A delayed reply from an older registry snapshot must not
+                // roll a live binding back after a newer CommitEnd.
+                if generation < self.applied_prefix_set_policy_generation {
+                    return;
+                }
+            }
+            policy::PolicyRx::PrefixSetInventory { generation, .. }
+                if self.receiving_prefix_set_policy_generation == Some(generation) =>
+            {
+                self.receiving_prefix_set_policy_generation = None;
+            }
+            _ => {}
+        }
+        let (name, ident, policy_type, prefix_set) = match msg {
+            policy::PolicyRx::PrefixSetInventory {
+                generation,
+                prefix_sets,
+            } => {
+                let commit_snapshot = self
+                    .pending_prefix_set_policy_updates
+                    .contains_key(&generation);
+                if generation >= self.prefix_set_inventory_generation {
+                    self.prefix_set_inventory_generation = generation;
+                    self.prefix_set_inventory = prefix_sets.clone();
+                }
+                if commit_snapshot {
+                    self.prefix_set_inventory_history
+                        .insert(generation, prefix_sets);
+                } else {
+                    // Subscribe sends one current inventory outside a commit
+                    // bracket. Treat that snapshot as already published so
+                    // initial Register replies at the same generation resolve
+                    // immediately (including after a structural VRF respawn).
+                    self.applied_prefix_set_policy_generation =
+                        self.applied_prefix_set_policy_generation.max(generation);
+                }
+                return;
+            }
+            policy::PolicyRx::PrefixSet {
+                generation: _,
+                name,
+                ident,
+                policy_type,
+                prefix_set,
+            } => (name, ident, policy_type, prefix_set),
+            _ => return,
+        };
+        self.apply_prefix_set_policy_update(name, ident, policy_type, prefix_set, true);
+    }
+
+    fn apply_prefix_set_policy_update(
+        &mut self,
+        name: String,
+        ident: usize,
+        policy_type: policy::PolicyType,
+        prefix_set: Option<policy::PrefixSet>,
+        reevaluate: bool,
+    ) -> Option<PrefixSetBindingKey> {
+        let direction = match policy_type {
+            policy::PolicyType::PrefixSetIn => InOut::Input,
+            policy::PolicyType::PrefixSetOut => InOut::Output,
+            _ => return None,
+        };
+        let key = self.prefix_set_watch_bindings.get(&ident).copied()?;
+        let PrefixSetBindingKey {
+            peer_idx,
+            afi_safi,
+            direction: expected_direction,
+        } = key;
+        if direction != expected_direction {
+            return None;
+        }
+        self.peers.get_by_idx(peer_idx)?;
+        if let Some(pending) = self.pending_output_prefix_sets.get_mut(&key)
+            && pending.name.as_deref() == Some(name.as_str())
+            && self.prefix_set_watch_ids.get(&key) == Some(&ident)
+        {
+            // Resolution can beat the ownership fence.  Retain the newest
+            // object in the pending install; the continuation will apply it
+            // atomically with the name instead of losing this one-shot reply.
+            pending.prefix_set = prefix_set;
+            return Some(key);
+        }
+        let peer = self.peers.get_by_idx(peer_idx).expect("checked above");
+        let slot = peer.prefix_set_at(afi_safi, direction);
+        // Ignore a stale in-flight answer after an unbind/rebind.
+        if slot.name.as_deref() != Some(name.as_str()) {
+            return None;
+        }
+        if slot.prefix_set == prefix_set {
+            return None;
+        }
+        self.install_prefix_set_binding(
+            peer_idx,
+            afi_safi,
+            direction,
+            Some(name),
+            prefix_set,
+            reevaluate,
+        );
+        Some(key)
+    }
+
+    fn finish_prefix_set_policy_commit(&mut self, generation: u64) {
+        let configs = self
+            .pending_prefix_set_config_updates
+            .remove(&generation)
+            .unwrap_or_default();
+        let updates = self
+            .pending_prefix_set_policy_updates
+            .remove(&generation)
+            .unwrap_or_default();
+        self.applied_prefix_set_policy_generation =
+            self.applied_prefix_set_policy_generation.max(generation);
+
+        let mut changed = HashSet::new();
+        for config in configs {
+            let peer_idx = self.peers.get(&config.address).map(|peer| peer.ident);
+            if self.bind_prefix_set(
+                config.address,
+                config.afi_safi,
+                config.direction,
+                config.name,
+                false,
+                Some(generation),
+            ) && let Some(peer_idx) = peer_idx
+            {
+                changed.insert(PrefixSetBindingKey {
+                    peer_idx,
+                    afi_safi: config.afi_safi,
+                    direction: config.direction,
+                });
+            }
+        }
+        for update in updates {
+            if let policy::PolicyRx::PrefixSet {
+                name,
+                ident,
+                policy_type,
+                prefix_set,
+                ..
+            } = update
+                && let Some(key) =
+                    self.apply_prefix_set_policy_update(name, ident, policy_type, prefix_set, false)
+            {
+                changed.insert(key);
+            }
+        }
+        // A policy commit whose acknowledgement was lost can publish its
+        // generation without ConfigManager ever dispatching the matching BGP
+        // CommitEnd.  The rollback then closes a newer generation.  Nothing
+        // can legitimately deliver an older marker after this FIFO boundary,
+        // so discard every orphan at or below it while retaining policy
+        // generations that are already queued ahead of BGP.
+        self.pending_prefix_set_policy_updates
+            .retain(|pending_generation, _| *pending_generation > generation);
+        self.prefix_set_inventory_history
+            .retain(|inventory_generation, _| *inventory_generation > generation);
+        if self
+            .receiving_prefix_set_policy_generation
+            .is_some_and(|receiving| receiving <= generation)
+        {
+            self.receiving_prefix_set_policy_generation = None;
+        }
+
+        self.deferred_input_prefix_set_replays.extend(
+            changed
+                .into_iter()
+                .filter(|key| key.direction == InOut::Input),
+        );
+        self.replay_deferred_input_prefix_sets_if_ready();
+    }
+
+    fn replay_deferred_input_prefix_sets_if_ready(&mut self) {
+        if !self.pending_output_prefix_sets.is_empty() {
+            return;
+        }
+        let replays: Vec<_> = self.deferred_input_prefix_set_replays.drain().collect();
+        for key in replays {
+            if self.peers.get_by_idx(key.peer_idx).is_some() {
+                self.reapply_prefix_set(key.peer_idx, key.afi_safi, InOut::Input);
+            }
+        }
+    }
+
+    fn reapply_prefix_set(&mut self, peer_idx: usize, afi_safi: AfiSafi, direction: InOut) {
+        self.reapply_prefix_set_inner(peer_idx, afi_safi, direction, false);
+    }
+
+    fn reapply_prefix_set_handoff(&mut self, peer_idx: usize, afi_safi: AfiSafi, direction: InOut) {
+        self.reapply_prefix_set_inner(peer_idx, afi_safi, direction, true);
+    }
+
+    fn reapply_prefix_set_inner(
+        &mut self,
+        peer_idx: usize,
+        afi_safi: AfiSafi,
+        direction: InOut,
+        handoff: bool,
+    ) {
+        let exporter = self.exporter();
+        let mut top = super::super::peer::BgpTop {
+            router_id: &self.router_id,
+            srv6_ipv6_export: None,
+            local_rib: &mut self.local_rib,
+            shard: &mut self.shard,
+            tx: &self.tx,
+            rib_client: &self.ctx.rib,
+            attr_store: &mut self.attr_store,
+            update_groups: &mut self.update_groups,
+            interface_addrs: &self.interface_addrs,
+            vrf_export: Some(&exporter),
+            color_policy: Some(&self.color_policy),
+            flex_algo_routes: None,
+            flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
+            vrf_import: None,
+            nexthop_cache: None,
+            vrf_transport_v4: Some(&self.transport_v4),
+            vrf_transport_v6: Some(&self.transport_v6),
+            central_label_alloc: None,
+            as_sets_withdraw: true,
+        };
+        match direction {
+            InOut::Input => super::super::route::route_soft_in_peer_vrf(
+                peer_idx,
+                afi_safi,
+                &mut top,
+                &mut self.peers,
+            ),
+            InOut::Output if handoff => super::super::route::route_soft_out_peer_vrf_handoff(
+                peer_idx,
+                afi_safi,
+                &mut top,
+                &mut self.peers,
+            ),
+            InOut::Output => super::super::route::route_soft_out_peer_vrf(
+                peer_idx,
+                afi_safi,
+                &mut top,
+                &mut self.peers,
+            ),
+        }
+    }
+
     /// Drive the per-VRF task. The loop exits cleanly when the
     /// global task sends [`BgpVrfMsg::Shutdown`] or when the
     /// inbound channel is closed (i.e. every sender — the global
@@ -1161,11 +2331,22 @@ impl BgpVrf {
     pub async fn event_loop(&mut self) {
         loop {
             tokio::select! {
+                biased;
+                // ConfigManager's policy CommitEnd barrier guarantees this
+                // commit-final inventory is queued before BGP CommitEnd can
+                // publish a binding.  Drain policy first so bind_prefix_set
+                // always consults the matching final snapshot.
+                Some(msg) = self.policy_rx.recv() => {
+                    self.process_policy_msg(msg);
+                }
                 msg = self.global_rx.recv() => {
                     match msg {
                         Some(BgpVrfMsg::Shutdown) => {
                             bgp_vrf_trace!(&self.tracing, vrf = %self.name, "bgp vrf: shutdown");
                             break;
+                        }
+                        Some(BgpVrfMsg::PrefixSetCommitEnd { generation }) => {
+                            self.finish_prefix_set_policy_commit(generation);
                         }
                         Some(other) => self.process_global_msg(other),
                         None => {
@@ -1202,6 +2383,9 @@ impl BgpVrf {
                     // command here; render against this VRF's RIB/peers.
                     crate::bgp::show::process_vrf_show(self, msg).await;
                 }
+                Some(msg) = self.output_prefix_set_rx.recv() => {
+                    self.process_output_prefix_set_ready(msg);
+                }
                 Some(msg) = self.rx.recv() => {
                     self.process_msg(msg);
                 }
@@ -1230,34 +2414,43 @@ impl BgpVrf {
                     tx: self.global_tx.clone(),
                     label: self.label,
                 };
-                let mut top = BgpTop {
-                    router_id: &self.router_id,
-                    srv6_ipv6_export: None,
-                    local_rib: &mut self.local_rib,
-                    shard: &mut self.shard,
-                    tx: &self.tx,
-                    rib_client: &self.ctx.rib,
-                    attr_store: &mut self.attr_store,
-                    update_groups: &mut self.update_groups,
-                    interface_addrs: &self.interface_addrs,
-                    vrf_export: Some(&exporter),
-                    // Color → Flex-Algo binding is a default-VRF
-                    // concept today; per-VRF support is a follow-up.
-                    color_policy: Some(&self.color_policy),
-                    flex_algo_routes: None,
-                    flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
-                    // Per-VRF tasks never receive VPNv4 NLRI directly,
-                    // so no import dispatcher to thread through.
-                    vrf_import: None,
-                    nexthop_cache: None,
-                    vrf_transport_v4: Some(&self.transport_v4),
-                    vrf_transport_v6: Some(&self.transport_v6),
-                    central_label_alloc: None,
-                    as_sets_withdraw: true,
-                };
-                // Per-VRF tasks don't drive the global shard pool (their
-                // RIB is the VRF's own); ingest stays synchronous.
-                fsm(&mut top, &mut self.peers, ident, event, None);
+                {
+                    let mut top = BgpTop {
+                        router_id: &self.router_id,
+                        srv6_ipv6_export: None,
+                        local_rib: &mut self.local_rib,
+                        shard: &mut self.shard,
+                        tx: &self.tx,
+                        rib_client: &self.ctx.rib,
+                        attr_store: &mut self.attr_store,
+                        update_groups: &mut self.update_groups,
+                        interface_addrs: &self.interface_addrs,
+                        vrf_export: Some(&exporter),
+                        // Color → Flex-Algo binding is a default-VRF
+                        // concept today; per-VRF support is a follow-up.
+                        color_policy: Some(&self.color_policy),
+                        flex_algo_routes: None,
+                        flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
+                        // Per-VRF tasks never receive VPNv4 NLRI directly,
+                        // so no import dispatcher to thread through.
+                        vrf_import: None,
+                        nexthop_cache: None,
+                        vrf_transport_v4: Some(&self.transport_v4),
+                        vrf_transport_v6: Some(&self.transport_v6),
+                        central_label_alloc: None,
+                        as_sets_withdraw: true,
+                    };
+                    // Per-VRF tasks don't drive the global shard pool (their
+                    // RIB is the VRF's own); ingest stays synchronous.
+                    fsm(&mut top, &mut self.peers, ident, event, None);
+                }
+                if self
+                    .peers
+                    .get_by_idx(ident)
+                    .is_some_and(|peer| !peer.state.is_established())
+                {
+                    self.apply_disconnected_output_prefix_sets(ident);
+                }
             }
             Message::Accept(_, _) => {
                 // Active-connect path is driven by `Event(...)` from
@@ -1937,13 +3130,13 @@ impl BgpVrf {
     }
 
     /// Inverse of [`Self::originate_self_network_v4`]: drop the
-    /// self-originated row (ident 0 / remote 0) for `prefix`,
+    /// self-originated row (`ORIGINATED_PEER` / remote 0) for `prefix`,
     /// re-run best-path, and either re-export the surviving winner
     /// or emit `WithdrawExport` when nothing else carries the
     /// prefix. Driven by [`BgpVrfMsg::WithdrawNetwork`] when a
     /// `network` is removed from a running VRF.
     pub fn withdraw_self_network_v4(&mut self, prefix: ipnet::Ipv4Net) {
-        let removed = self.shard.remove(None, prefix, 0, 0);
+        let removed = self.shard.remove(None, prefix, 0, ORIGINATED_PEER);
         if removed.is_empty() {
             return;
         }
@@ -1978,7 +3171,7 @@ impl BgpVrf {
 
     /// IPv6 counterpart of [`Self::withdraw_self_network_v4`].
     pub fn withdraw_self_network_v6(&mut self, prefix: ipnet::Ipv6Net) {
-        let removed = self.shard.remove_v6(prefix, 0, 0);
+        let removed = self.shard.remove_v6(prefix, 0, ORIGINATED_PEER);
         if removed.is_empty() {
             return;
         }
@@ -2158,9 +3351,11 @@ impl BgpVrf {
         }
     }
 
-    /// A self-originated `BgpRib` (ident 0 / remote 0) carrying the
-    /// interned `attr`. Identical shape for v4 and v6 — only the
-    /// shard table the caller inserts into differs.
+    /// A self-originated `BgpRib` (`ORIGINATED_PEER` / remote 0) carrying
+    /// the interned `attr`. The sentinel is essential: peer slots start at
+    /// zero, and using `ident = 0` makes the first CE session's split-horizon
+    /// check misclassify every local `network` as learned from that CE.
+    /// Identical shape for v4 and v6 — only the shard table differs.
     fn self_originated_rib(
         &self,
         attr: std::sync::Arc<bgp_packet::BgpAttr>,
@@ -2169,7 +3364,7 @@ impl BgpVrf {
             remote_id: 0,
             local_id: 0,
             attr,
-            ident: 0,
+            ident: ORIGINATED_PEER,
             router_id: self.router_id,
             weight: 32768,
             typ: super::super::route::BgpRibType::Originated,
@@ -2196,6 +3391,22 @@ impl BgpVrf {
     /// `Shutdown`.
     fn process_global_msg(&mut self, msg: BgpVrfMsg) {
         match msg {
+            BgpVrfMsg::PrefixSetConfig {
+                address,
+                afi_safi,
+                direction,
+                name,
+                generation,
+            } => self
+                .pending_prefix_set_config_updates
+                .entry(generation)
+                .or_default()
+                .push(PendingPrefixSetConfig {
+                    address,
+                    afi_safi,
+                    direction,
+                    name,
+                }),
             BgpVrfMsg::ColourSteering {
                 color_policy,
                 srv6_shadow,
@@ -2472,6 +3683,7 @@ impl BgpVrf {
                     });
                 }
             }
+            BgpVrfMsg::PrefixSetCommitEnd { .. } => unreachable!("handled in event_loop"),
             BgpVrfMsg::Shutdown => unreachable!("handled in event_loop"),
         }
     }
@@ -2530,6 +3742,895 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), vrf.event_loop())
             .await
             .expect("event_loop returns after Shutdown");
+    }
+
+    #[test]
+    fn prefix_set_inventory_makes_rebind_atomic_and_missing_fail_closed() {
+        use std::net::IpAddr;
+
+        use bgp_packet::{Afi, AfiSafi, Safi};
+        use ipnet::IpNet;
+
+        use crate::bgp::peer::Peer;
+        use crate::policy::prefix::set::PrefixSetEntry;
+        use crate::policy::{Message as PolicyMessage, PolicyRx, PolicyType, PrefixSet};
+
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let ctx = test_ctx_for_vrf(42, "vrf-atomic-policy");
+        let (_rib_tx, rib_rx) = mpsc::unbounded_channel();
+        let router_id = Ipv4Addr::new(192, 0, 2, 1);
+        let (mut vrf, _inbox) = BgpVrf::new(
+            "vrf-atomic-policy".to_string(),
+            ctx,
+            router_id,
+            65000,
+            16,
+            global_tx,
+            rib_rx,
+        );
+        let (policy_tx, mut policy_messages) = unbounded_channel();
+        vrf.attach_policy_actor(policy_tx);
+        assert!(matches!(
+            policy_messages.try_recv(),
+            Ok(PolicyMessage::Subscribe { .. })
+        ));
+
+        let address: IpAddr = "192.0.2.2".parse().unwrap();
+        let peer = Peer::new(
+            0,
+            65000,
+            router_id,
+            65001,
+            address,
+            None,
+            vrf.tx.clone(),
+            vrf.ctx.clone(),
+        );
+        vrf.peers.insert(address, peer);
+        let peer_idx = vrf.peers.get(&address).unwrap().ident;
+        let family = AfiSafi::new(Afi::Ip, Safi::Unicast);
+
+        let old_prefix: IpNet = "198.51.100.0/24".parse().unwrap();
+        let mut old_set = PrefixSet::default();
+        old_set.insert(old_prefix, PrefixSetEntry::default());
+        let new_prefix: IpNet = "203.0.113.0/24".parse().unwrap();
+        let mut new_set = PrefixSet::default();
+        new_set.insert(new_prefix, PrefixSetEntry::default());
+        vrf.process_policy_msg(PolicyRx::PrefixSetInventory {
+            generation: 1,
+            prefix_sets: std::collections::BTreeMap::from([
+                ("OLD".to_string(), old_set.clone()),
+                ("NEW".to_string(), new_set.clone()),
+            ]),
+        });
+
+        vrf.bind_prefix_set(
+            address,
+            family,
+            InOut::Input,
+            Some("OLD".to_string()),
+            false,
+            None,
+        );
+        let old_ident = match policy_messages.try_recv() {
+            Ok(PolicyMessage::Register { name, ident, .. }) if name == "OLD" => ident,
+            other => panic!("expected OLD registration, got {other:?}"),
+        };
+        let slot = vrf
+            .peers
+            .get_by_idx(peer_idx)
+            .unwrap()
+            .prefix_set_at(family, InOut::Input);
+        assert_eq!(slot.name.as_deref(), Some("OLD"));
+        assert_eq!(slot.prefix_set.as_ref(), Some(&old_set));
+
+        // The same transaction edits OLD's body and rebinds OLD -> NEW.
+        // OLD's direct watch update is buffered until after the binding
+        // message, so the edited OLD body is never replayed live.
+        let mut edited_old_set = old_set.clone();
+        edited_old_set.insert(
+            "198.51.101.0/24".parse::<IpNet>().unwrap(),
+            PrefixSetEntry::default(),
+        );
+        vrf.process_policy_msg(PolicyRx::PrefixSetCommitStart { generation: 2 });
+        vrf.process_policy_msg(PolicyRx::PrefixSet {
+            generation: 2,
+            name: "OLD".to_string(),
+            ident: old_ident,
+            policy_type: PolicyType::PrefixSetIn,
+            prefix_set: Some(edited_old_set.clone()),
+        });
+        let slot = vrf
+            .peers
+            .get_by_idx(peer_idx)
+            .unwrap()
+            .prefix_set_at(family, InOut::Input);
+        assert_eq!(slot.prefix_set.as_ref(), Some(&old_set));
+        vrf.process_policy_msg(PolicyRx::PrefixSetInventory {
+            generation: 2,
+            prefix_sets: std::collections::BTreeMap::from([
+                ("OLD".to_string(), edited_old_set),
+                ("NEW".to_string(), new_set.clone()),
+            ]),
+        });
+
+        // NEW exists in the commit-final inventory, so both fields move in
+        // one call. No transient edited-OLD or None replay occurs.
+        vrf.bind_prefix_set(
+            address,
+            family,
+            InOut::Input,
+            Some("NEW".to_string()),
+            true,
+            Some(2),
+        );
+        vrf.finish_prefix_set_policy_commit(2);
+        let slot = vrf
+            .peers
+            .get_by_idx(peer_idx)
+            .unwrap()
+            .prefix_set_at(family, InOut::Input);
+        assert_eq!(slot.name.as_deref(), Some("NEW"));
+        assert_eq!(slot.prefix_set.as_ref(), Some(&new_set));
+        assert!(matches!(
+            policy_messages.try_recv(),
+            Ok(PolicyMessage::Unregister { name, .. }) if name == "OLD"
+        ));
+        let new_ident = match policy_messages.try_recv() {
+            Ok(PolicyMessage::Register { name, ident, .. }) if name == "NEW" => ident,
+            other => panic!("expected NEW registration, got {other:?}"),
+        };
+
+        // An old-watch clearing reply cannot undo the atomic swap.
+        vrf.process_policy_msg(PolicyRx::PrefixSet {
+            generation: 2,
+            name: "OLD".to_string(),
+            ident: old_ident,
+            policy_type: PolicyType::PrefixSetIn,
+            prefix_set: None,
+        });
+        let slot = vrf
+            .peers
+            .get_by_idx(peer_idx)
+            .unwrap()
+            .prefix_set_at(family, InOut::Input);
+        assert_eq!(slot.name.as_deref(), Some("NEW"));
+        assert_eq!(slot.prefix_set.as_ref(), Some(&new_set));
+
+        // Register's same-snapshot resolve reply is idempotent.
+        vrf.process_policy_msg(PolicyRx::PrefixSet {
+            generation: 2,
+            name: "NEW".to_string(),
+            ident: new_ident,
+            policy_type: PolicyType::PrefixSetIn,
+            prefix_set: Some(new_set.clone()),
+        });
+        let slot = vrf
+            .peers
+            .get_by_idx(peer_idx)
+            .unwrap()
+            .prefix_set_at(family, InOut::Input);
+        assert_eq!(slot.name.as_deref(), Some("NEW"));
+        assert_eq!(slot.prefix_set.as_ref(), Some(&new_set));
+        assert_eq!(
+            vrf.shard.in_policy[&peer_idx].prefix_set.name.as_deref(),
+            Some("NEW")
+        );
+
+        // The policy actor can process NEW's Register only after it has
+        // already committed the next transaction.  Its resolve reply then
+        // contains generation 3's body even though this watch did not exist
+        // when generation 3's direct notifications were emitted.  The
+        // generation tag must keep that reply behind BGP CommitEnd(3).
+        let mut edited_new_set = new_set.clone();
+        edited_new_set.insert(
+            "203.0.114.0/24".parse::<IpNet>().unwrap(),
+            PrefixSetEntry::default(),
+        );
+        vrf.process_policy_msg(PolicyRx::PrefixSetCommitStart { generation: 3 });
+        vrf.process_policy_msg(PolicyRx::PrefixSetInventory {
+            generation: 3,
+            prefix_sets: std::collections::BTreeMap::from([(
+                "NEW".to_string(),
+                edited_new_set.clone(),
+            )]),
+        });
+        vrf.process_policy_msg(PolicyRx::PrefixSet {
+            generation: 3,
+            name: "NEW".to_string(),
+            ident: new_ident,
+            policy_type: PolicyType::PrefixSetIn,
+            prefix_set: Some(edited_new_set.clone()),
+        });
+        // A second policy commit can be fully queued before BGP handles the
+        // first marker. Its update must remain in its own generation bucket.
+        let mut twice_edited_new_set = edited_new_set.clone();
+        twice_edited_new_set.insert(
+            "203.0.115.0/24".parse::<IpNet>().unwrap(),
+            PrefixSetEntry::default(),
+        );
+        vrf.process_policy_msg(PolicyRx::PrefixSetCommitStart { generation: 4 });
+        vrf.process_policy_msg(PolicyRx::PrefixSet {
+            generation: 4,
+            name: "NEW".to_string(),
+            ident: new_ident,
+            policy_type: PolicyType::PrefixSetIn,
+            prefix_set: Some(twice_edited_new_set.clone()),
+        });
+        vrf.process_policy_msg(PolicyRx::PrefixSetInventory {
+            generation: 4,
+            prefix_sets: std::collections::BTreeMap::from([(
+                "NEW".to_string(),
+                twice_edited_new_set.clone(),
+            )]),
+        });
+        assert_eq!(
+            vrf.peers
+                .get_by_idx(peer_idx)
+                .unwrap()
+                .prefix_set_at(family, InOut::Input)
+                .prefix_set
+                .as_ref(),
+            Some(&new_set)
+        );
+        vrf.finish_prefix_set_policy_commit(3);
+        assert_eq!(
+            vrf.peers
+                .get_by_idx(peer_idx)
+                .unwrap()
+                .prefix_set_at(family, InOut::Input)
+                .prefix_set
+                .as_ref(),
+            Some(&edited_new_set)
+        );
+        vrf.finish_prefix_set_policy_commit(4);
+        assert_eq!(
+            vrf.peers
+                .get_by_idx(peer_idx)
+                .unwrap()
+                .prefix_set_at(family, InOut::Input)
+                .prefix_set
+                .as_ref(),
+            Some(&twice_edited_new_set)
+        );
+
+        // MISSING is absent from the same commit-final inventory.  The name
+        // and unresolved object install immediately, closing the old permit
+        // window without waiting for Register's asynchronous None reply.
+        vrf.bind_prefix_set(
+            address,
+            family,
+            InOut::Input,
+            Some("MISSING".to_string()),
+            true,
+            None,
+        );
+        assert!(matches!(
+            policy_messages.try_recv(),
+            Ok(PolicyMessage::Unregister { name, .. }) if name == "NEW"
+        ));
+        let missing_ident = match policy_messages.try_recv() {
+            Ok(PolicyMessage::Register { name, ident, .. }) if name == "MISSING" => ident,
+            other => panic!("expected MISSING registration, got {other:?}"),
+        };
+        let slot = vrf
+            .peers
+            .get_by_idx(peer_idx)
+            .unwrap()
+            .prefix_set_at(family, InOut::Input);
+        assert_eq!(slot.name.as_deref(), Some("MISSING"));
+        assert!(slot.prefix_set.is_none());
+
+        // A later create arrives through the existing watch and resolves the
+        // fail-closed slot without another binding change.
+        vrf.process_policy_msg(PolicyRx::PrefixSetInventory {
+            generation: 5,
+            prefix_sets: std::collections::BTreeMap::from([(
+                "MISSING".to_string(),
+                old_set.clone(),
+            )]),
+        });
+        vrf.process_policy_msg(PolicyRx::PrefixSet {
+            generation: 5,
+            name: "MISSING".to_string(),
+            ident: missing_ident,
+            policy_type: PolicyType::PrefixSetIn,
+            prefix_set: Some(old_set.clone()),
+        });
+        let slot = vrf
+            .peers
+            .get_by_idx(peer_idx)
+            .unwrap()
+            .prefix_set_at(family, InOut::Input);
+        assert_eq!(slot.name.as_deref(), Some("MISSING"));
+        assert_eq!(slot.prefix_set.as_ref(), Some(&old_set));
+    }
+
+    #[tokio::test]
+    async fn queued_commit_inventory_precedes_binding_message() {
+        use std::net::IpAddr;
+
+        use bgp_packet::{Afi, AfiSafi, Safi};
+        use ipnet::IpNet;
+
+        use crate::bgp::peer::Peer;
+        use crate::policy::prefix::set::PrefixSetEntry;
+        use crate::policy::{Message as PolicyMessage, PolicyRx, PrefixSet};
+
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let ctx = test_ctx_for_vrf(43, "vrf-commit-order");
+        let (_rib_tx, rib_rx) = mpsc::unbounded_channel();
+        let router_id = Ipv4Addr::new(192, 0, 2, 1);
+        let (mut vrf, inbox) = BgpVrf::new(
+            "vrf-commit-order".to_string(),
+            ctx,
+            router_id,
+            65000,
+            16,
+            global_tx,
+            rib_rx,
+        );
+        let (policy_tx, mut policy_messages) = unbounded_channel();
+        vrf.attach_policy_actor(policy_tx);
+        let policy_feed = match policy_messages.try_recv() {
+            Ok(PolicyMessage::Subscribe { tx, .. }) => tx,
+            other => panic!("expected policy subscription, got {other:?}"),
+        };
+
+        let address: IpAddr = "192.0.2.2".parse().unwrap();
+        vrf.peers.insert(
+            address,
+            Peer::new(
+                0,
+                65000,
+                router_id,
+                65001,
+                address,
+                None,
+                vrf.tx.clone(),
+                vrf.ctx.clone(),
+            ),
+        );
+        let family = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let mut set = PrefixSet::default();
+        set.insert(
+            "203.0.113.0/24".parse::<IpNet>().unwrap(),
+            PrefixSetEntry::default(),
+        );
+
+        // This is the cross-actor order established by ConfigManager: policy
+        // inventory is queued before BGP CommitEnd can publish the binding.
+        policy_feed
+            .send(PolicyRx::PrefixSetCommitStart { generation: 9 })
+            .unwrap();
+        policy_feed
+            .send(PolicyRx::PrefixSetInventory {
+                generation: 9,
+                prefix_sets: std::collections::BTreeMap::from([(
+                    "SAME-COMMIT".to_string(),
+                    set.clone(),
+                )]),
+            })
+            .unwrap();
+        inbox
+            .send(BgpVrfMsg::PrefixSetConfig {
+                address,
+                afi_safi: family,
+                direction: InOut::Input,
+                name: Some("SAME-COMMIT".to_string()),
+                generation: 9,
+            })
+            .unwrap();
+        inbox
+            .send(BgpVrfMsg::PrefixSetCommitEnd { generation: 9 })
+            .unwrap();
+        inbox.send(BgpVrfMsg::Shutdown).unwrap();
+        vrf.event_loop().await;
+
+        let slot = vrf
+            .peers
+            .get(&address)
+            .unwrap()
+            .prefix_set_at(family, InOut::Input);
+        assert_eq!(slot.name.as_deref(), Some("SAME-COMMIT"));
+        assert_eq!(slot.prefix_set.as_ref(), Some(&set));
+    }
+
+    #[test]
+    fn rollback_commit_gc_removes_orphaned_older_policy_generation_only() {
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let ctx = test_ctx_for_vrf(43, "vrf-policy-rollback-gc");
+        let (_rib_tx, rib_rx) = mpsc::unbounded_channel();
+        let (mut vrf, _inbox) = BgpVrf::new(
+            "vrf-policy-rollback-gc".to_string(),
+            ctx,
+            Ipv4Addr::new(192, 0, 2, 1),
+            65000,
+            16,
+            global_tx,
+            rib_rx,
+        );
+
+        // Generation 41 was fully published by policy, but its ack was lost,
+        // so ConfigManager never sent BGP CommitEnd(41). Generation 42 is the
+        // inverse rollback. Policy generation 43 is already queued ahead and
+        // must survive until its own BGP marker arrives.
+        for generation in [41, 42, 43] {
+            vrf.process_policy_msg(policy::PolicyRx::PrefixSetCommitStart { generation });
+            vrf.process_policy_msg(policy::PolicyRx::PrefixSetInventory {
+                generation,
+                prefix_sets: std::collections::BTreeMap::new(),
+            });
+        }
+        assert_eq!(vrf.pending_prefix_set_policy_updates.len(), 3);
+        assert_eq!(vrf.prefix_set_inventory_history.len(), 3);
+
+        vrf.finish_prefix_set_policy_commit(42);
+
+        assert_eq!(
+            vrf.pending_prefix_set_policy_updates
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![43]
+        );
+        assert_eq!(
+            vrf.prefix_set_inventory_history
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![43]
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_v6_rebind_discards_old_session_fence_and_cancels_pending_deny() {
+        use std::net::IpAddr;
+
+        use bgp_packet::{Afi, AfiSafi, CapMultiProtocol, Safi};
+        use ipnet::IpNet;
+
+        use crate::bgp::peer::{Peer, State};
+        use crate::bgp::route::{BgpRib, BgpRibType};
+        use crate::policy::{PrefixSet, prefix::set::PrefixSetEntry};
+
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let ctx = test_ctx_for_vrf(42, "vrf-output-fence");
+        let (_rib_tx, rib_rx) = mpsc::unbounded_channel();
+        let router_id = Ipv4Addr::new(192, 0, 2, 1);
+        let (mut vrf, _inbox) = BgpVrf::new(
+            "vrf-output-fence".to_string(),
+            ctx,
+            router_id,
+            65000,
+            16,
+            global_tx,
+            rib_rx,
+        );
+        let address: IpAddr = "192.0.2.2".parse().unwrap();
+        let mut peer = Peer::new(
+            0,
+            65000,
+            router_id,
+            65000,
+            address,
+            None,
+            vrf.tx.clone(),
+            vrf.ctx.clone(),
+        );
+        peer.state = State::Established;
+        peer.session_generation = 1;
+        let family = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+        let cap = peer
+            .cap_map
+            .entries
+            .get_mut(&CapMultiProtocol::new(&Afi::Ip6, &Safi::Unicast))
+            .unwrap();
+        cap.send = true;
+        cap.recv = true;
+        let prefix = "2001:db8:100::/48".parse().unwrap();
+        let mut old_set = PrefixSet::default();
+        old_set.insert(IpNet::V6(prefix), PrefixSetEntry::default());
+        let slot = peer.prefix_set_slot(family, InOut::Output);
+        slot.name = Some("OLD6".to_string());
+        slot.prefix_set = Some(old_set);
+        peer.rebuild_out_policy();
+        let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
+        peer.packet_tx = Some(packet_tx);
+        vrf.peers.insert(address, peer);
+        let peer_idx = vrf.peers.get(&address).unwrap().ident;
+        crate::bgp::update_group::attach(
+            &mut vrf.update_groups,
+            &mut vrf.peers,
+            peer_idx,
+            router_id,
+            true,
+            &vrf.interface_addrs,
+        );
+        let rib = BgpRib::new(
+            99,
+            Ipv4Addr::new(192, 0, 2, 99),
+            BgpRibType::EBGP,
+            0,
+            0,
+            &bgp_packet::BgpAttr {
+                nexthop: Some(bgp_packet::BgpNexthop::Ipv6(
+                    "2001:db8::99".parse().unwrap(),
+                )),
+                ..Default::default()
+            },
+            None,
+            None,
+            false,
+        );
+        vrf.shard.update_v6(prefix, rib);
+
+        // The replacement exists but denies this route. This is the
+        // adversarial OLD-permit -> NEW-deny transition.
+        let new_set = PrefixSet::default();
+
+        vrf.install_prefix_set_binding(
+            peer_idx,
+            family,
+            InOut::Output,
+            Some("NEW6".to_string()),
+            Some(new_set),
+            true,
+        );
+        // Route mutation after the fence: normal incremental advertise is
+        // optimistic about Adj-RIB-Out, but draining excludes this peer from
+        // the old group's flush, so no packet reached the wire.
+        let optimistic = vrf.shard.v6.1.get(&prefix).unwrap().clone();
+        vrf.peers
+            .get_mut_by_idx(peer_idx)
+            .unwrap()
+            .adj_out
+            .v6
+            .add(prefix, optimistic.clone());
+        let old_gid = vrf.peers.get_by_idx(peer_idx).unwrap().update_group_id[&family].clone();
+        let group = vrf
+            .update_groups
+            .get_mut(&family)
+            .unwrap()
+            .group_by_id_mut(&old_gid)
+            .unwrap();
+        crate::bgp::update_group::send_ipv6(
+            group,
+            bgp_packet::Ipv6Nlri { id: 0, prefix },
+            optimistic.attr,
+            99,
+            &vrf.tx,
+            false,
+        );
+        assert!(
+            packet_rx.try_recv().is_err(),
+            "optimistic Adj-RIB-Out has advanced without a wire packet"
+        );
+        assert_eq!(
+            vrf.peers
+                .get_by_idx(peer_idx)
+                .unwrap()
+                .prefix_set_at(family, InOut::Output)
+                .name
+                .as_deref(),
+            Some("OLD6"),
+            "the active policy must remain old until the flush fence resolves"
+        );
+
+        let ready = tokio::time::timeout(Duration::from_secs(1), vrf.output_prefix_set_rx.recv())
+            .await
+            .expect("fence continuation")
+            .expect("ready message");
+        let (key, token, session_generation) = match ready {
+            OutputPrefixSetReady::Fenced {
+                key,
+                token,
+                session_generation,
+            } => (key, token, session_generation),
+            other => panic!("expected gate-off fence, got {other:?}"),
+        };
+        vrf.process_output_prefix_set_ready(OutputPrefixSetReady::Fenced {
+            key,
+            token: token.wrapping_add(1),
+            session_generation,
+        });
+        assert_eq!(
+            vrf.peers
+                .get_by_idx(peer_idx)
+                .unwrap()
+                .prefix_set_at(family, InOut::Output)
+                .name
+                .as_deref(),
+            Some("OLD6"),
+            "a stale fence callback must neither apply nor unfence"
+        );
+        let old_gid = &vrf.peers.get_by_idx(peer_idx).unwrap().update_group_id[&family];
+        assert!(
+            vrf.update_groups
+                .get(&family)
+                .unwrap()
+                .group_by_id(old_gid)
+                .unwrap()
+                .draining_members_ipv6
+                .contains(&peer_idx)
+        );
+        // The TCP session bounces after the old fence completes but before
+        // its callback runs. The callback must restart against generation 2,
+        // never restore generation 1's optimistic snapshot.
+        vrf.peers
+            .get_mut_by_idx(peer_idx)
+            .unwrap()
+            .session_generation = 2;
+        vrf.process_output_prefix_set_ready(OutputPrefixSetReady::Fenced {
+            key,
+            token,
+            session_generation,
+        });
+        assert_eq!(
+            vrf.peers
+                .get_by_idx(peer_idx)
+                .unwrap()
+                .prefix_set_at(family, InOut::Output)
+                .name
+                .as_deref(),
+            Some("OLD6"),
+            "an old-session completion must not install policy"
+        );
+        let ready = tokio::time::timeout(Duration::from_secs(1), vrf.output_prefix_set_rx.recv())
+            .await
+            .expect("new-session fence continuation")
+            .expect("ready message");
+        vrf.process_output_prefix_set_ready(ready);
+        let peer = vrf.peers.get_by_idx(peer_idx).unwrap();
+        assert_eq!(
+            peer.prefix_set_at(family, InOut::Output).name.as_deref(),
+            Some("NEW6")
+        );
+        assert!(
+            packet_rx.try_recv().is_ok(),
+            "the pending optimistic route must be cancelled with a withdraw"
+        );
+        assert!(
+            packet_rx.try_recv().is_err(),
+            "NEW-deny must not advertise the old-policy pending route"
+        );
+        let gid = &peer.update_group_id[&family];
+        assert_eq!(
+            vrf.update_groups
+                .get(&family)
+                .unwrap()
+                .group_by_id(gid)
+                .unwrap()
+                .sig
+                .prefix_set_out_name
+                .as_deref(),
+            Some("NEW6")
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_v4_extracted_handoff_promotes_member_in_new_owner() {
+        use std::net::IpAddr;
+
+        use bgp_packet::{Afi, AfiSafi, BgpAttr, BgpNexthop, CapMultiProtocol, Safi};
+
+        use crate::bgp::group_egress::{GroupEgressDeltaV4, GroupEgressTask};
+        use crate::bgp::peer::{Peer, State};
+        use crate::bgp::route::{BgpRib, BgpRibType};
+        use crate::policy::PrefixSet;
+
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let ctx = test_ctx_for_vrf(42, "vrf-output-handoff");
+        let (_rib_tx, rib_rx) = mpsc::unbounded_channel();
+        let router_id = Ipv4Addr::new(192, 0, 2, 1);
+        let (mut vrf, _inbox) = BgpVrf::new(
+            "vrf-output-handoff".to_string(),
+            ctx,
+            router_id,
+            65000,
+            16,
+            global_tx,
+            rib_rx,
+        );
+        let address: IpAddr = "192.0.2.2".parse().unwrap();
+        let mut peer = Peer::new(
+            0,
+            65000,
+            router_id,
+            65001,
+            address,
+            None,
+            vrf.tx.clone(),
+            vrf.ctx.clone(),
+        );
+        peer.state = State::Established;
+        let family = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let cap = peer
+            .cap_map
+            .entries
+            .get_mut(&CapMultiProtocol::new(&Afi::Ip, &Safi::Unicast))
+            .unwrap();
+        cap.send = true;
+        cap.recv = true;
+        let slot = peer.prefix_set_slot(family, InOut::Output);
+        slot.name = Some("OLD4".to_string());
+        slot.prefix_set = Some(PrefixSet::default());
+        peer.rebuild_out_policy();
+        let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
+        peer.packet_tx = Some(packet_tx);
+        vrf.peers.insert(address, peer);
+        let peer_idx = vrf.peers.get(&address).unwrap().ident;
+        crate::bgp::update_group::attach(
+            &mut vrf.update_groups,
+            &mut vrf.peers,
+            peer_idx,
+            router_id,
+            true,
+            &vrf.interface_addrs,
+        );
+        let old_gid = vrf.peers.get_by_idx(peer_idx).unwrap().update_group_id[&family].clone();
+
+        // Pre-create the target-signature group with a real task. This avoids
+        // mutating the process-global feature gate while exercising the VRF
+        // continuation exactly as gate-on runtime does.
+        {
+            let peer = vrf.peers.get_mut_by_idx(peer_idx).unwrap();
+            let slot = peer.prefix_set_slot(family, InOut::Output);
+            slot.name = Some("NEWEST4".to_string());
+            slot.prefix_set = Some(PrefixSet::default());
+            peer.rebuild_out_policy();
+        }
+        crate::bgp::update_group::attach(
+            &mut vrf.update_groups,
+            &mut vrf.peers,
+            peer_idx,
+            router_id,
+            true,
+            &vrf.interface_addrs,
+        );
+        let new_gid = vrf.peers.get_by_idx(peer_idx).unwrap().update_group_id[&family].clone();
+        {
+            let group = vrf
+                .update_groups
+                .get_mut(&family)
+                .unwrap()
+                .group_by_id_mut(&new_gid)
+                .unwrap();
+            group.members.remove(&peer_idx);
+            group.task = Some(GroupEgressTask::spawn(new_gid.clone()));
+        }
+        {
+            let peer = vrf.peers.get_mut_by_idx(peer_idx).unwrap();
+            peer.update_group_id.insert(family, old_gid);
+            let slot = peer.prefix_set_slot(family, InOut::Output);
+            slot.name = Some("OLD4".to_string());
+            slot.prefix_set = Some(PrefixSet::default());
+            peer.rebuild_out_policy();
+        }
+
+        let key = PrefixSetBindingKey {
+            peer_idx,
+            afi_safi: family,
+            direction: InOut::Output,
+        };
+        let token = 77;
+        let prefix: ipnet::Ipv4Net = "198.51.100.0/24".parse().unwrap();
+        let previous = BgpRib::new(
+            99,
+            Ipv4Addr::new(203, 0, 113, 9),
+            BgpRibType::EBGP,
+            0,
+            0,
+            &BgpAttr {
+                nexthop: Some(BgpNexthop::Ipv4(Ipv4Addr::new(192, 0, 2, 9))),
+                ..Default::default()
+            },
+            None,
+            None,
+            false,
+        );
+        vrf.pending_output_prefix_sets.insert(
+            key,
+            PendingOutputPrefixSet {
+                token,
+                session_generation: 0,
+                name: Some("NEW4".to_string()),
+                prefix_set: Some(PrefixSet::default()),
+                reevaluate: true,
+            },
+        );
+        vrf.extracting_output_prefix_sets.insert(key);
+        // Extract A completed after rebind B superseded it. Preserve A's
+        // actual-wire baseline; a second snapshot can omit rows withdrawn
+        // from the old owner only after A removed this peer and must not
+        // replace that baseline.
+        vrf.process_output_prefix_set_ready(OutputPrefixSetReady::Extracted {
+            key,
+            token: token - 1,
+            session_generation: 0,
+            previous: vec![(prefix, previous)],
+        });
+        let carried = vrf
+            .output_prefix_set_rx
+            .try_recv()
+            .expect("first extraction is requeued for the current token");
+        assert!(matches!(
+            &carried,
+            OutputPrefixSetReady::Extracted {
+                token: carried_token,
+                previous,
+                ..
+            } if *carried_token == token && previous.len() == 1
+        ));
+        assert!(
+            vrf.extracting_output_prefix_sets.contains(&key),
+            "the original extraction stays latched until its baseline reaches the latest token"
+        );
+
+        // A third rebind arrives before the carried completion is consumed.
+        // It must share the original baseline rather than opening a second
+        // extraction against owner state that has changed since the peer was
+        // fenced (for example, after this prefix was withdrawn there).
+        let newest_token = token + 1;
+        vrf.pending_output_prefix_sets.insert(
+            key,
+            PendingOutputPrefixSet {
+                token: newest_token,
+                session_generation: 0,
+                name: Some("NEWEST4".to_string()),
+                prefix_set: Some(PrefixSet::default()),
+                reevaluate: true,
+            },
+        );
+        assert_eq!(
+            vrf.peers
+                .get_by_idx(peer_idx)
+                .unwrap()
+                .prefix_set_at(family, InOut::Output)
+                .name
+                .as_deref(),
+            Some("OLD4")
+        );
+        vrf.process_output_prefix_set_ready(carried);
+        assert!(vrf.extracting_output_prefix_sets.contains(&key));
+        let carried = vrf
+            .output_prefix_set_rx
+            .try_recv()
+            .expect("the first baseline is carried through the third rebind");
+        assert!(matches!(
+            &carried,
+            OutputPrefixSetReady::Extracted {
+                token: carried_token,
+                previous,
+                ..
+            } if *carried_token == newest_token && previous.len() == 1
+        ));
+        vrf.process_output_prefix_set_ready(carried);
+
+        let peer = vrf.peers.get_by_idx(peer_idx).unwrap();
+        assert_eq!(
+            peer.prefix_set_at(family, InOut::Output).name.as_deref(),
+            Some("NEWEST4")
+        );
+        assert_eq!(peer.update_group_id[&family], new_gid);
+        let group = vrf
+            .update_groups
+            .get(&family)
+            .unwrap()
+            .group_by_id(&new_gid)
+            .unwrap();
+        let (reply, count) = tokio::sync::oneshot::channel();
+        group
+            .task
+            .as_ref()
+            .unwrap()
+            .send(GroupEgressDeltaV4::CountMembers { reply });
+        assert_eq!(count.await.unwrap(), 1, "Finish must promote the member");
+        packet_rx
+            .try_recv()
+            .expect("the original baseline must withdraw a route denied by the newest policy");
+        assert!(packet_rx.try_recv().is_err());
+        assert!(!vrf.extracted_output_prefix_sets.contains_key(&key));
     }
 
     #[tokio::test]
@@ -3165,6 +5266,614 @@ mod tests {
             vrf.mup_originated.get(&9).map(Vec::len),
             Some(1),
             "only the surviving direction stays tracked"
+        );
+    }
+    /// A live prefix-set edit that leaves the post-policy route unchanged
+    /// must not emit a duplicate UPDATE. The first soft-out establishes the
+    /// Adj-RIB-Out row; the second uses a different prefix-set body that still
+    /// permits the same route and therefore has no wire delta.
+    #[test]
+    fn prefix_set_soft_out_suppresses_unchanged_update() {
+        use crate::bgp::peer::{Peer, State};
+        use crate::bgp::route::{BgpRib, BgpRibType};
+        use crate::policy::PrefixSet;
+        use crate::policy::prefix::set::PrefixSetEntry;
+        use bgp_packet::{Afi, AfiSafi, BgpAttr, BgpNexthop, CapMultiProtocol, Safi};
+        use ipnet::IpNet;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let ctx = test_ctx_for_vrf(42, "vrf-soft-out");
+        let (_rib_tx, rib_rx) = mpsc::unbounded_channel();
+        let router_id = Ipv4Addr::new(192, 0, 2, 1);
+        let (mut vrf, _inbox) = BgpVrf::new(
+            "vrf-soft-out".to_string(),
+            ctx,
+            router_id,
+            65000,
+            16,
+            global_tx,
+            rib_rx,
+        );
+
+        let address: IpAddr = "192.0.2.2".parse().unwrap();
+        let mut peer = Peer::new(
+            0,
+            65000,
+            router_id,
+            65001,
+            address,
+            None,
+            vrf.tx.clone(),
+            test_ctx_for_vrf(42, "vrf-soft-out"),
+        );
+        peer.state = State::Established;
+        let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let cap = peer
+            .cap_map
+            .entries
+            .get_mut(&CapMultiProtocol::new(&Afi::Ip, &Safi::Unicast))
+            .expect("IPv4 unicast capability slot");
+        cap.send = true;
+        cap.recv = true;
+        let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
+        peer.packet_tx = Some(packet_tx);
+
+        let prefix = "198.51.100.0/24".parse().unwrap();
+        let mut exact = PrefixSet::default();
+        exact.insert(IpNet::V4(prefix), PrefixSetEntry::default());
+        let slot = peer.prefix_set_slot(afi_safi, InOut::Output);
+        slot.name = Some("PEER-OUT-V4".to_string());
+        slot.prefix_set = Some(exact);
+        peer.rebuild_out_policy();
+        vrf.peers.insert(address, peer);
+        let peer_idx = vrf.peers.get(&address).unwrap().ident;
+
+        let attr = BgpAttr {
+            nexthop: Some(BgpNexthop::Ipv4(Ipv4Addr::new(192, 0, 2, 9))),
+            ..Default::default()
+        };
+        let rib = BgpRib::new(
+            99,
+            Ipv4Addr::new(192, 0, 2, 9),
+            BgpRibType::EBGP,
+            0,
+            0,
+            &attr,
+            None,
+            None,
+            false,
+        );
+        vrf.shard.update(None, prefix, rib);
+
+        vrf.reapply_prefix_set(peer_idx, afi_safi, InOut::Output);
+        assert!(
+            packet_rx.try_recv().is_ok(),
+            "the initially permitted route must be advertised"
+        );
+        while packet_rx.try_recv().is_ok() {}
+
+        // Different policy body, identical permit result and egress attr.
+        let mut covering = PrefixSet::default();
+        covering.insert(
+            "198.51.0.0/16".parse().unwrap(),
+            PrefixSetEntry {
+                le: Some(24),
+                ..Default::default()
+            },
+        );
+        let peer = vrf.peers.get_mut_by_idx(peer_idx).unwrap();
+        peer.prefix_set_slot(afi_safi, InOut::Output).prefix_set = Some(covering);
+        peer.rebuild_out_policy();
+
+        vrf.reapply_prefix_set(peer_idx, afi_safi, InOut::Output);
+        assert!(
+            packet_rx.try_recv().is_err(),
+            "unchanged post-policy route must not be re-sent"
+        );
+        assert!(
+            vrf.peers
+                .get_by_idx(peer_idx)
+                .unwrap()
+                .adj_out
+                .v4
+                .0
+                .contains_key(&prefix),
+            "the route remains advertised"
+        );
+    }
+
+    /// The first configured CE owns peer slot zero.  Locally-originated
+    /// networks must use the out-of-band source sentinel, otherwise the
+    /// ordinary split-horizon check mistakes them for routes learned from
+    /// this peer and the establish-time dump sends nothing.
+    #[test]
+    fn initial_sync_to_first_peer_filters_local_networks_without_split_horizon_collision() {
+        use crate::bgp::peer::{Peer, State};
+        use crate::policy::{PrefixSet, prefix::set::PrefixSetEntry};
+        use bgp_packet::{Afi, AfiSafi, CapMultiProtocol, Safi};
+        use ipnet::IpNet;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let ctx = test_ctx_for_vrf(42, "vrf-initial-local");
+        let (_rib_tx, rib_rx) = mpsc::unbounded_channel();
+        let router_id = Ipv4Addr::new(192, 0, 2, 1);
+        let (mut vrf, _inbox) = BgpVrf::new(
+            "vrf-initial-local".to_string(),
+            ctx,
+            router_id,
+            65000,
+            16,
+            global_tx,
+            rib_rx,
+        );
+
+        let allow4 = "10.21.0.0/24".parse().unwrap();
+        let deny4 = "10.21.99.0/24".parse().unwrap();
+        let allow6 = "2001:db8:21::/48".parse().unwrap();
+        let deny6 = "2001:db8:99::/48".parse().unwrap();
+        vrf.originate_self_network_v4(allow4);
+        vrf.originate_self_network_v4(deny4);
+        vrf.originate_self_network_v6(allow6);
+        vrf.originate_self_network_v6(deny6);
+
+        for rows in vrf.shard.v4.0.values() {
+            assert!(rows.iter().all(|rib| rib.ident == ORIGINATED_PEER));
+        }
+        for rows in vrf.shard.v6.0.values() {
+            assert!(rows.iter().all(|rib| rib.ident == ORIGINATED_PEER));
+        }
+
+        let address: IpAddr = "192.0.2.2".parse().unwrap();
+        let mut peer = Peer::new(
+            0,
+            65000,
+            router_id,
+            65001,
+            address,
+            None,
+            vrf.tx.clone(),
+            test_ctx_for_vrf(42, "vrf-initial-local"),
+        );
+        assert_eq!(peer.ident, 0, "regression requires the first peer slot");
+        peer.state = State::Established;
+        for (afi, safi) in [(Afi::Ip, Safi::Unicast), (Afi::Ip6, Safi::Unicast)] {
+            let cap = peer
+                .cap_map
+                .entries
+                .get_mut(&CapMultiProtocol::new(&afi, &safi))
+                .unwrap();
+            cap.send = true;
+            cap.recv = true;
+        }
+        let mut out4 = PrefixSet::default();
+        out4.insert(IpNet::V4(allow4), PrefixSetEntry::default());
+        let mut out6 = PrefixSet::default();
+        out6.insert(IpNet::V6(allow6), PrefixSetEntry::default());
+        let v4 = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let v6 = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+        peer.prefix_set_slot(v4, InOut::Output).name = Some("LOCAL4-OUT".to_string());
+        peer.prefix_set_slot(v4, InOut::Output).prefix_set = Some(out4);
+        peer.prefix_set_slot(v6, InOut::Output).name = Some("LOCAL6-OUT".to_string());
+        peer.prefix_set_slot(v6, InOut::Output).prefix_set = Some(out6);
+        peer.rebuild_out_policy();
+        let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
+        peer.packet_tx = Some(packet_tx);
+
+        {
+            let mut top = super::super::super::peer::BgpTop {
+                router_id: &vrf.router_id,
+                srv6_ipv6_export: None,
+                local_rib: &mut vrf.local_rib,
+                shard: &mut vrf.shard,
+                tx: &vrf.tx,
+                rib_client: &vrf.ctx.rib,
+                attr_store: &mut vrf.attr_store,
+                update_groups: &mut vrf.update_groups,
+                interface_addrs: &vrf.interface_addrs,
+                vrf_export: None,
+                color_policy: Some(&vrf.color_policy),
+                flex_algo_routes: None,
+                flex_algo_srv6_routes: Some(&vrf.flex_algo_srv6_routes),
+                vrf_import: None,
+                nexthop_cache: None,
+                vrf_transport_v4: Some(&vrf.transport_v4),
+                vrf_transport_v6: Some(&vrf.transport_v6),
+                central_label_alloc: None,
+                as_sets_withdraw: true,
+            };
+            super::super::super::route::route_sync_ipv4(&mut peer, &mut top);
+            super::super::super::route::route_sync_ipv6(&mut peer, &mut top);
+        }
+
+        assert!(peer.adj_out.v4.0.contains_key(&allow4));
+        assert!(!peer.adj_out.v4.0.contains_key(&deny4));
+        assert!(peer.adj_out.v6.0.contains_key(&allow6));
+        assert!(!peer.adj_out.v6.0.contains_key(&deny6));
+        // One permitted UPDATE plus EoR per family. Exact Adj-RIB-Out checks
+        // above distinguish the advertisements from the EoR packets.
+        assert_eq!(std::iter::from_fn(|| packet_rx.try_recv().ok()).count(), 4);
+    }
+}
+
+#[cfg(test)]
+mod prefix_set_fib_tests {
+    use super::*;
+    use bgp_packet::{BgpAttr, BgpNexthop, CapMultiProtocol, Ipv4Nlri, Ipv6Nlri};
+    use ipnet::IpNet;
+    use tokio::sync::mpsc::{self, unbounded_channel};
+
+    use crate::bgp::peer::{BgpTop, Peer, State};
+    use crate::bgp::policy::InOut;
+    use crate::bgp::route::{route_ipv4_update, route_ipv6_update};
+    use crate::policy::{PrefixSet, prefix::set::PrefixSetEntry};
+    use crate::rib;
+    use crate::rib::client::{ProtoId, RibClient, RibInbound};
+
+    fn binding(name: &str, prefix: &str) -> crate::bgp::PrefixSetValue {
+        let mut set = PrefixSet::default();
+        set.insert(prefix.parse::<IpNet>().unwrap(), PrefixSetEntry::default());
+        crate::bgp::PrefixSetValue {
+            name: Some(name.to_string()),
+            prefix_set: Some(set),
+        }
+    }
+
+    #[test]
+    fn live_inbound_prefix_set_replay_reconciles_v4_v6_fib() {
+        let (rib_tx, mut messages) = unbounded_channel::<RibInbound>();
+        let ctx = ProtoContext::for_vrf(
+            RibClient::new(rib_tx, ProtoId::from_raw(99)),
+            99,
+            "vrf-policy-test".to_string(),
+        );
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let (_redist_tx, redist_rx) = mpsc::unbounded_channel();
+        let router_id = Ipv4Addr::new(192, 0, 2, 1);
+        let (mut vrf, _inbox) = BgpVrf::new(
+            "vrf-policy-test".to_string(),
+            ctx,
+            router_id,
+            65000,
+            16,
+            global_tx,
+            redist_rx,
+        );
+
+        let address = "192.0.2.2".parse().unwrap();
+        let mut peer = Peer::new(
+            0,
+            65000,
+            router_id,
+            65000,
+            address,
+            None,
+            vrf.tx.clone(),
+            vrf.ctx.clone(),
+        );
+        peer.state = State::Established;
+        peer.remote_id = Ipv4Addr::new(192, 0, 2, 2);
+        let v4 = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let v6 = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+        *peer.prefix_set_slot(v4, InOut::Input) = binding("IN4", "198.51.100.0/24");
+        *peer.prefix_set_slot(v6, InOut::Input) = binding("IN6", "2001:db8:100::/48");
+        vrf.peers.insert(address, peer);
+        let peer_idx = vrf.peers.get(&address).unwrap().ident;
+        vrf.replace_shard_in_policy(peer_idx);
+
+        let p4 = "198.51.100.0/24".parse().unwrap();
+        let p6 = "2001:db8:100::/48".parse().unwrap();
+        {
+            let exporter = vrf.exporter();
+            let mut top = BgpTop {
+                router_id: &vrf.router_id,
+                srv6_ipv6_export: None,
+                local_rib: &mut vrf.local_rib,
+                shard: &mut vrf.shard,
+                tx: &vrf.tx,
+                rib_client: &vrf.ctx.rib,
+                attr_store: &mut vrf.attr_store,
+                update_groups: &mut vrf.update_groups,
+                interface_addrs: &vrf.interface_addrs,
+                vrf_export: Some(&exporter),
+                color_policy: Some(&vrf.color_policy),
+                flex_algo_routes: None,
+                flex_algo_srv6_routes: Some(&vrf.flex_algo_srv6_routes),
+                vrf_import: None,
+                nexthop_cache: None,
+                vrf_transport_v4: Some(&vrf.transport_v4),
+                vrf_transport_v6: Some(&vrf.transport_v6),
+                central_label_alloc: None,
+                as_sets_withdraw: true,
+            };
+            route_ipv4_update(
+                peer_idx,
+                &Ipv4Nlri { id: 0, prefix: p4 },
+                None,
+                None,
+                &BgpAttr {
+                    nexthop: Some(BgpNexthop::Ipv4(Ipv4Addr::new(192, 0, 2, 2))),
+                    ..Default::default()
+                },
+                None,
+                None,
+                &mut top,
+                &mut vrf.peers,
+                false,
+            );
+            route_ipv6_update(
+                peer_idx,
+                &Ipv6Nlri { id: 0, prefix: p6 },
+                None,
+                None,
+                &BgpAttr {
+                    nexthop: Some(BgpNexthop::Ipv6("2001:db8::2".parse().unwrap())),
+                    ..Default::default()
+                },
+                None,
+                &mut top,
+                &mut vrf.peers,
+                false,
+            );
+        }
+        assert!(
+            matches!(messages.try_recv().unwrap().msg, rib::Message::Ipv4Add { prefix, .. } if prefix == p4)
+        );
+        assert!(
+            matches!(messages.try_recv().unwrap().msg, rib::Message::Ipv6Add { prefix, .. } if prefix == p6)
+        );
+
+        vrf.peers
+            .get_mut_by_idx(peer_idx)
+            .unwrap()
+            .prefix_set_slot(v4, InOut::Input)
+            .prefix_set = Some(PrefixSet::default());
+        vrf.replace_shard_in_policy(peer_idx);
+        vrf.reapply_prefix_set(peer_idx, v4, InOut::Input);
+        assert!(
+            matches!(messages.try_recv().unwrap().msg, rib::Message::Ipv4Del { prefix, .. } if prefix == p4)
+        );
+
+        vrf.peers
+            .get_mut_by_idx(peer_idx)
+            .unwrap()
+            .prefix_set_slot(v6, InOut::Input)
+            .prefix_set = Some(PrefixSet::default());
+        vrf.reapply_prefix_set(peer_idx, v6, InOut::Input);
+        assert!(
+            matches!(messages.try_recv().unwrap().msg, rib::Message::Ipv6Del { prefix, .. } if prefix == p6)
+        );
+
+        *vrf.peers
+            .get_mut_by_idx(peer_idx)
+            .unwrap()
+            .prefix_set_slot(v4, InOut::Input) = binding("IN4", "198.51.100.0/24");
+        vrf.replace_shard_in_policy(peer_idx);
+        vrf.reapply_prefix_set(peer_idx, v4, InOut::Input);
+        assert!(
+            matches!(messages.try_recv().unwrap().msg, rib::Message::Ipv4Add { prefix, .. } if prefix == p4)
+        );
+
+        *vrf.peers
+            .get_mut_by_idx(peer_idx)
+            .unwrap()
+            .prefix_set_slot(v6, InOut::Input) = binding("IN6", "2001:db8:100::/48");
+        vrf.reapply_prefix_set(peer_idx, v6, InOut::Input);
+        assert!(
+            matches!(messages.try_recv().unwrap().msg, rib::Message::Ipv6Add { prefix, .. } if prefix == p6)
+        );
+        assert!(messages.try_recv().is_err(), "no extra FIB churn");
+    }
+
+    #[tokio::test]
+    async fn prefix_set_commit_does_not_transiently_leak_between_peers() {
+        let (rib_tx, _rib_messages) = unbounded_channel::<RibInbound>();
+        let ctx = ProtoContext::for_vrf(
+            RibClient::new(rib_tx, ProtoId::from_raw(100)),
+            100,
+            "vrf-atomic-policy-test".to_string(),
+        );
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let (_redist_tx, redist_rx) = mpsc::unbounded_channel();
+        let router_id = Ipv4Addr::new(192, 0, 2, 1);
+        let (mut vrf, _inbox) = BgpVrf::new(
+            "vrf-atomic-policy-test".to_string(),
+            ctx,
+            router_id,
+            65000,
+            16,
+            global_tx,
+            redist_rx,
+        );
+        let family = AfiSafi::new(Afi::Ip, Safi::Unicast);
+
+        let source_address = "192.0.2.2".parse().unwrap();
+        let mut source = Peer::new(
+            0,
+            65000,
+            router_id,
+            65000,
+            source_address,
+            None,
+            vrf.tx.clone(),
+            vrf.ctx.clone(),
+        );
+        source.state = State::Established;
+        source.remote_id = Ipv4Addr::new(192, 0, 2, 2);
+        *source.prefix_set_slot(family, InOut::Input) = binding("OLD-DENY", "203.0.113.0/24");
+        vrf.peers.insert(source_address, source);
+        let source_idx = vrf.peers.get(&source_address).unwrap().ident;
+        vrf.replace_shard_in_policy(source_idx);
+
+        let target_address = "192.0.2.3".parse().unwrap();
+        let mut target = Peer::new(
+            0,
+            65000,
+            router_id,
+            65001,
+            target_address,
+            None,
+            vrf.tx.clone(),
+            vrf.ctx.clone(),
+        );
+        target.state = State::Established;
+        target.remote_id = Ipv4Addr::new(192, 0, 2, 3);
+        let cap = target
+            .cap_map
+            .entries
+            .get_mut(&CapMultiProtocol::new(&Afi::Ip, &Safi::Unicast))
+            .unwrap();
+        cap.send = true;
+        cap.recv = true;
+        let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
+        target.packet_tx = Some(packet_tx);
+        vrf.peers.insert(target_address, target);
+        let target_idx = vrf.peers.get(&target_address).unwrap().ident;
+
+        // Keep one denied route in Adj-RIB-In. The same generation will
+        // permit it inbound while denying it outbound on the other peer.
+        let prefix = "198.51.100.0/24".parse().unwrap();
+        {
+            let exporter = vrf.exporter();
+            let mut top = BgpTop {
+                router_id: &vrf.router_id,
+                srv6_ipv6_export: None,
+                local_rib: &mut vrf.local_rib,
+                shard: &mut vrf.shard,
+                tx: &vrf.tx,
+                rib_client: &vrf.ctx.rib,
+                attr_store: &mut vrf.attr_store,
+                update_groups: &mut vrf.update_groups,
+                interface_addrs: &vrf.interface_addrs,
+                vrf_export: Some(&exporter),
+                color_policy: Some(&vrf.color_policy),
+                flex_algo_routes: None,
+                flex_algo_srv6_routes: Some(&vrf.flex_algo_srv6_routes),
+                vrf_import: None,
+                nexthop_cache: None,
+                vrf_transport_v4: Some(&vrf.transport_v4),
+                vrf_transport_v6: Some(&vrf.transport_v6),
+                central_label_alloc: None,
+                as_sets_withdraw: true,
+            };
+            route_ipv4_update(
+                source_idx,
+                &Ipv4Nlri { id: 0, prefix },
+                None,
+                None,
+                &BgpAttr {
+                    nexthop: Some(BgpNexthop::Ipv4(Ipv4Addr::new(192, 0, 2, 2))),
+                    ..Default::default()
+                },
+                None,
+                None,
+                &mut top,
+                &mut vrf.peers,
+                false,
+            );
+        }
+        assert!(!vrf.shard.v4.0.contains_key(&prefix));
+        assert!(
+            vrf.shard
+                .adj_in(source_idx)
+                .unwrap()
+                .v4
+                .0
+                .contains_key(&prefix)
+        );
+
+        let mut allow = PrefixSet::default();
+        allow.insert(IpNet::V4(prefix), PrefixSetEntry::default());
+        vrf.process_policy_msg(policy::PolicyRx::PrefixSetCommitStart { generation: 11 });
+        vrf.process_policy_msg(policy::PolicyRx::PrefixSetInventory {
+            generation: 11,
+            prefix_sets: std::collections::BTreeMap::from([
+                ("ALLOW-IN".to_string(), allow),
+                ("DENY-OUT".to_string(), PrefixSet::default()),
+            ]),
+        });
+
+        // Adversarial order: inbound loosen first. It must remain buffered;
+        // the old behavior replayed it here through target's permit-all.
+        vrf.process_global_msg(BgpVrfMsg::PrefixSetConfig {
+            address: source_address,
+            afi_safi: family,
+            direction: InOut::Input,
+            name: Some("ALLOW-IN".to_string()),
+            generation: 11,
+        });
+        assert!(!vrf.shard.v4.0.contains_key(&prefix));
+        assert!(
+            !vrf.peers
+                .get_by_idx(target_idx)
+                .unwrap()
+                .adj_out
+                .v4
+                .0
+                .contains_key(&prefix)
+        );
+
+        vrf.process_global_msg(BgpVrfMsg::PrefixSetConfig {
+            address: target_address,
+            afi_safi: family,
+            direction: InOut::Output,
+            name: Some("DENY-OUT".to_string()),
+            generation: 11,
+        });
+        vrf.finish_prefix_set_policy_commit(11);
+
+        // Both objects are in the install phase, but inbound replay waits for
+        // outbound ownership to cross its fence and install DENY-OUT.
+        assert_eq!(
+            vrf.peers
+                .get_by_idx(source_idx)
+                .unwrap()
+                .prefix_set_at(family, InOut::Input)
+                .name
+                .as_deref(),
+            Some("ALLOW-IN")
+        );
+        assert_eq!(
+            vrf.pending_output_prefix_sets
+                .get(&PrefixSetBindingKey {
+                    peer_idx: target_idx,
+                    afi_safi: family,
+                    direction: InOut::Output,
+                })
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("DENY-OUT")
+        );
+        assert!(!vrf.shard.v4.0.contains_key(&prefix));
+
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            vrf.output_prefix_set_rx.recv(),
+        )
+        .await
+        .expect("outbound fence completion")
+        .expect("outbound handoff result");
+        vrf.process_output_prefix_set_ready(ready);
+
+        assert!(
+            vrf.shard.v4.0.contains_key(&prefix),
+            "inbound replay completed"
+        );
+        assert!(
+            !vrf.peers
+                .get_by_idx(target_idx)
+                .unwrap()
+                .adj_out
+                .v4
+                .0
+                .contains_key(&prefix),
+            "route was never admitted to target's Adj-RIB-Out"
+        );
+        assert!(
+            packet_rx.try_recv().is_err(),
+            "route was never put on the wire"
         );
     }
 }

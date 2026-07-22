@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -31,6 +32,8 @@ use super::msg::{BgpGlobalMsg, BgpVrfMsg};
 use super::sid::Srv6VrfSid;
 
 use crate::config::RibSubscriber;
+
+static NEXT_POLICY_INCARNATION: AtomicU64 = AtomicU64::new(1);
 
 /// Per-VRF task handle stashed on [`crate::bgp::Bgp::vrf_registry`].
 /// Holds the inbound sender so the global task can dispatch
@@ -85,6 +88,9 @@ pub struct BgpVrfHandle {
     /// have.
     pub evpn_advertise_v4: bool,
     pub evpn_advertise_v6: bool,
+    /// Policy actor identity for whole-client cleanup before a respawn.
+    pub policy_tx: UnboundedSender<crate::policy::Message>,
+    pub policy_proto: String,
 }
 
 /// Pure diff: which VRF names need to be spawned (in `desired`
@@ -170,6 +176,7 @@ pub fn spawn_bgp_vrf(
     rib_subscriber: &RibSubscriber,
     srv6: Option<Srv6VrfSid>,
     tracing_cfg: crate::bgp::tracing::BgpTracing,
+    policy_tx: UnboundedSender<crate::policy::Message>,
     global_tx: UnboundedSender<BgpGlobalMsg>,
 ) -> BgpVrfHandle {
     // Snapshot for logging + ILM install so we can move
@@ -217,6 +224,11 @@ pub fn spawn_bgp_vrf(
         global_tx,
         rib_rx,
     );
+    let policy_proto = format!(
+        "bgp:vrf:{name}:policy:{}",
+        NEXT_POLICY_INCARNATION.fetch_add(1, Ordering::Relaxed),
+    );
+    vrf.attach_policy_actor_as(policy_tx.clone(), policy_proto.clone());
     // Inter-AS Option AB: re-export imported VPNv4 routes (see the field
     // doc on `BgpVrf`). Carried from the staged VRF config.
     vrf.inter_as_hybrid = cfg.inter_as_hybrid;
@@ -362,6 +374,8 @@ pub fn spawn_bgp_vrf(
         rd: cfg.rd,
         evpn_advertise_v4: cfg.evpn_advertise_v4,
         evpn_advertise_v6: cfg.evpn_advertise_v6,
+        policy_tx,
+        policy_proto,
     }
 }
 
@@ -512,6 +526,31 @@ fn materialize_peers(
             .get_mut(addr)
             .expect("peer was just inserted")
             .start();
+        // Bind names only after insertion assigned the stable local peer
+        // index used in policy-watch identifiers. Each unresolved name is
+        // immediately deny-all until the actor replies.
+        for (afi_safi, prefix_set) in &nbr_cfg.prefix_set {
+            if prefix_set.input.is_some() {
+                vrf.bind_prefix_set(
+                    *addr,
+                    *afi_safi,
+                    super::super::policy::InOut::Input,
+                    prefix_set.input.clone(),
+                    false,
+                    None,
+                );
+            }
+            if prefix_set.output.is_some() {
+                vrf.bind_prefix_set(
+                    *addr,
+                    *afi_safi,
+                    super::super::policy::InOut::Output,
+                    prefix_set.output.clone(),
+                    false,
+                    None,
+                );
+            }
+        }
         count += 1;
     }
     count
@@ -627,6 +666,11 @@ pub fn despawn_bgp_vrf(name: &str, handle: &BgpVrfHandle, rib_subscriber: &RibSu
     // both teardown and respawn. Sent before `Shutdown` so it's ordered
     // ahead of any later re-subscribe by the respawn's `spawn_bgp_vrf`.
     rib_subscriber.send_proto_cleanup(&format!("bgp:vrf:{name}"));
+    // FIFO on the shared policy actor sender guarantees cleanup precedes a
+    // subsequent respawn's Subscribe/Register messages for the same proto.
+    let _ = handle.policy_tx.send(crate::policy::Message::Unsubscribe {
+        proto: handle.policy_proto.clone(),
+    });
     if handle.inbox.send(BgpVrfMsg::Shutdown).is_err() {
         // Receiver already gone — the task exited on its own
         // (e.g. inbox-drop path). Nothing left to do.
@@ -655,8 +699,17 @@ mod tests {
     use super::*;
 
     fn handle(name: &str) -> BgpVrfHandle {
+        handle_with_config(name, &BgpVrfConfig::default(), Ipv4Addr::UNSPECIFIED, 65000)
+    }
+
+    fn handle_with_config(
+        name: &str,
+        cfg: &BgpVrfConfig,
+        router_id: Ipv4Addr,
+        asn: u32,
+    ) -> BgpVrfHandle {
         let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
-        let cfg = BgpVrfConfig::default();
+        let (policy_tx, _policy_rx) = unbounded_channel::<crate::policy::Message>();
         // Pass `None` for the kernel info — the diff tests don't
         // need the per-VRF `SO_BINDTODEVICE` binding; the
         // placeholder context is enough for lifecycle testing.
@@ -664,16 +717,35 @@ mod tests {
         let groups = BTreeMap::new();
         spawn_bgp_vrf(
             name.to_string(),
-            &cfg,
+            cfg,
             &groups,
-            Ipv4Addr::UNSPECIFIED,
-            65000,
+            router_id,
+            asn,
             /* label */ 16,
             None,
             &subscriber,
             /* srv6 */ None,
             /* tracing */ Default::default(),
+            policy_tx,
             global_tx,
+        )
+    }
+
+    fn compute_vrf_respawn(
+        before: &BTreeMap<String, BgpVrfConfig>,
+        before_groups: &BTreeMap<String, NeighborGroup>,
+        desired: &BTreeMap<String, BgpVrfConfig>,
+        desired_groups: &BTreeMap<String, NeighborGroup>,
+        running: &BTreeMap<String, BgpVrfHandle>,
+    ) -> Vec<String> {
+        super::compute_vrf_respawn(
+            before,
+            before_groups,
+            desired,
+            desired_groups,
+            running,
+            Ipv4Addr::UNSPECIFIED,
+            65000,
         )
     }
 
@@ -687,6 +759,15 @@ mod tests {
             rib_inbound_tx,
             std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
         )
+    }
+
+    #[tokio::test]
+    async fn respawn_uses_fresh_policy_incarnation() {
+        let first = handle("blue");
+        let second = handle("blue");
+        assert_ne!(first.policy_proto, second.policy_proto);
+        assert!(first.policy_proto.starts_with("bgp:vrf:blue:policy:"));
+        assert!(second.policy_proto.starts_with("bgp:vrf:blue:policy:"));
     }
 
     #[tokio::test]
@@ -819,6 +900,197 @@ mod tests {
         assert_eq!(peer.config.timer.connect_retry_time(), 120);
         assert_eq!(peer.config.timer.hold_time(), 180);
         assert_eq!(peer.config.timer.idle_hold_time(), 5);
+    }
+
+    #[tokio::test]
+    async fn materialize_peers_binds_prefix_sets_fail_closed() {
+        use super::super::super::policy::InOut;
+        use super::super::super::vrf_config::{
+            BgpVrfConfig, BgpVrfNeighborConfig, BgpVrfPrefixSetConfig,
+        };
+        use super::super::inst::BgpVrf;
+        use crate::context::ProtoContext;
+        use crate::policy::{Message as PolicyMessage, PolicyType};
+        use bgp_packet::{Afi, AfiSafi, Safi};
+
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let ctx = ProtoContext::default_table_no_rib();
+        let (_rib_tx, rib_rx) = unbounded_channel();
+        let (mut vrf, _inbox) = BgpVrf::new(
+            "v1".to_string(),
+            ctx,
+            Ipv4Addr::UNSPECIFIED,
+            65000,
+            16,
+            global_tx,
+            rib_rx,
+        );
+        let (policy_tx, mut policy_rx) = unbounded_channel();
+        vrf.attach_policy_actor(policy_tx);
+
+        let address: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let ipv4u = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let mut neighbor = BgpVrfNeighborConfig {
+            remote_as: Some(65001),
+            ..Default::default()
+        };
+        neighbor.prefix_set.insert(
+            ipv4u,
+            BgpVrfPrefixSetConfig {
+                input: Some("CE-IN".to_string()),
+                output: Some("CE-OUT".to_string()),
+            },
+        );
+        let mut cfg = BgpVrfConfig::default();
+        cfg.neighbors.insert(address, neighbor);
+
+        assert_eq!(materialize_peers(&mut vrf, &cfg, &BTreeMap::new()), 1);
+        let peer = vrf.peers.get(&address).expect("peer materialized");
+        let peer_idx = peer.ident;
+        let input = peer.prefix_set_at(ipv4u, InOut::Input);
+        let output = peer.prefix_set_at(ipv4u, InOut::Output);
+        assert_eq!(input.name.as_deref(), Some("CE-IN"));
+        assert!(
+            input.prefix_set.is_none(),
+            "input starts unresolved/deny-all"
+        );
+        assert_eq!(output.name.as_deref(), Some("CE-OUT"));
+        assert!(
+            output.prefix_set.is_none(),
+            "output starts unresolved/deny-all"
+        );
+        let shard_policy = vrf
+            .shard
+            .in_policy
+            .get(&peer_idx)
+            .expect("unresolved input must still install a shard snapshot");
+        assert_eq!(shard_policy.prefix_set.name.as_deref(), Some("CE-IN"));
+        assert!(shard_policy.prefix_set.prefix_set.is_none());
+
+        assert!(matches!(
+            policy_rx.recv().await,
+            Some(PolicyMessage::Subscribe { proto, .. }) if proto == "bgp:vrf:v1"
+        ));
+        for (expected_name, expected_type) in [
+            ("CE-IN", PolicyType::PrefixSetIn),
+            ("CE-OUT", PolicyType::PrefixSetOut),
+        ] {
+            assert!(matches!(
+                policy_rx.recv().await,
+                Some(PolicyMessage::Register {
+                    proto,
+                    name,
+                    ident: _,
+                    policy_type,
+                }) if proto == "bgp:vrf:v1"
+                    && name == expected_name
+                    && policy_type == expected_type
+            ));
+        }
+
+        // Reapplying the same binding is a runtime no-op: no duplicate watch
+        // registration and no soft replay is triggered.
+        vrf.bind_prefix_set(
+            address,
+            ipv4u,
+            InOut::Input,
+            Some("CE-IN".to_string()),
+            true,
+            None,
+        );
+        assert!(policy_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn prefix_set_watches_are_isolated_by_vrf_protocol_identity() {
+        use super::super::super::policy::InOut;
+        use super::super::super::vrf_config::{
+            BgpVrfConfig, BgpVrfNeighborConfig, BgpVrfPrefixSetConfig,
+        };
+        use super::super::inst::BgpVrf;
+        use crate::context::ProtoContext;
+        use crate::policy::{Message as PolicyMessage, PolicyType};
+        use bgp_packet::{Afi, AfiSafi, Safi};
+
+        let (policy_tx, mut policy_rx) = unbounded_channel();
+        let ipv4u = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let mut vrfs = Vec::new();
+
+        for (name, address, output) in [
+            ("blue", "192.0.2.1", "BLUE-OUT"),
+            ("red", "192.0.2.2", "RED-OUT"),
+        ] {
+            let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+            let (_rib_tx, rib_rx) = unbounded_channel();
+            let (mut vrf, _inbox) = BgpVrf::new(
+                name.to_string(),
+                ProtoContext::default_table_no_rib(),
+                Ipv4Addr::UNSPECIFIED,
+                65000,
+                16,
+                global_tx,
+                rib_rx,
+            );
+            vrf.attach_policy_actor(policy_tx.clone());
+
+            let address = address.parse().unwrap();
+            let mut neighbor = BgpVrfNeighborConfig {
+                remote_as: Some(65001),
+                ..Default::default()
+            };
+            neighbor.prefix_set.insert(
+                ipv4u,
+                BgpVrfPrefixSetConfig {
+                    input: Some("SHARED-IN".to_string()),
+                    output: Some(output.to_string()),
+                },
+            );
+            let mut cfg = BgpVrfConfig::default();
+            cfg.neighbors.insert(address, neighbor);
+            assert_eq!(materialize_peers(&mut vrf, &cfg, &BTreeMap::new()), 1);
+
+            let peer = vrf.peers.get(&address).unwrap();
+            assert_eq!(
+                peer.prefix_set_at(ipv4u, InOut::Input).name.as_deref(),
+                Some("SHARED-IN")
+            );
+            assert_eq!(
+                peer.prefix_set_at(ipv4u, InOut::Output).name.as_deref(),
+                Some(output)
+            );
+            vrfs.push(vrf);
+        }
+
+        for (vrf_name, output) in [("blue", "BLUE-OUT"), ("red", "RED-OUT")] {
+            let proto = format!("bgp:vrf:{vrf_name}");
+            assert!(matches!(
+                policy_rx.recv().await,
+                Some(PolicyMessage::Subscribe { proto: got, .. }) if got == proto
+            ));
+            assert!(matches!(
+                policy_rx.recv().await,
+                Some(PolicyMessage::Register {
+                    proto: got,
+                    name,
+                    policy_type: PolicyType::PrefixSetIn,
+                    ..
+                }) if got == proto && name == "SHARED-IN"
+            ));
+            assert!(matches!(
+                policy_rx.recv().await,
+                Some(PolicyMessage::Register {
+                    proto: got,
+                    name,
+                    policy_type: PolicyType::PrefixSetOut,
+                    ..
+                }) if got == proto && name == output
+            ));
+            assert_ne!(proto, "bgp", "default-VRF policy client stays isolated");
+        }
+
+        // Keep both tasks alive through message validation; dropping either
+        // must not mutate the other's peer-owned binding.
+        assert_eq!(vrfs.len(), 2);
     }
 
     /// A CE peer's negotiated MP family set is derived from its own
@@ -1060,5 +1332,277 @@ mod tests {
         let (to_spawn, to_despawn) = compute_vrf_diff(&desired, &running);
         assert!(to_spawn.is_empty());
         assert!(to_despawn.is_empty());
+    }
+
+    #[tokio::test]
+    async fn running_vrf_respawns_when_neighbor_is_added_or_deleted() {
+        use super::super::super::vrf_config::BgpVrfNeighborConfig;
+
+        let address: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let mut before = BTreeMap::new();
+        before.insert("v1".to_string(), BgpVrfConfig::default());
+        let mut with_neighbor = before.clone();
+        with_neighbor.get_mut("v1").unwrap().neighbors.insert(
+            address,
+            BgpVrfNeighborConfig {
+                remote_as: Some(65001),
+                ..Default::default()
+            },
+        );
+        let mut running = BTreeMap::new();
+        running.insert("v1".to_string(), handle("v1"));
+        let groups = BTreeMap::new();
+
+        assert_eq!(
+            compute_vrf_respawn(&before, &groups, &with_neighbor, &groups, &running),
+            vec!["v1".to_string()]
+        );
+        assert_eq!(
+            compute_vrf_respawn(&with_neighbor, &groups, &before, &groups, &running),
+            vec!["v1".to_string()]
+        );
+
+        let mut remote_as_changed = with_neighbor.clone();
+        remote_as_changed
+            .get_mut("v1")
+            .unwrap()
+            .neighbors
+            .get_mut(&address)
+            .unwrap()
+            .remote_as = Some(65002);
+        assert_eq!(
+            compute_vrf_respawn(
+                &with_neighbor,
+                &groups,
+                &remote_as_changed,
+                &groups,
+                &running,
+            ),
+            vec!["v1".to_string()]
+        );
+        assert!(
+            compute_vrf_respawn(&with_neighbor, &groups, &with_neighbor, &groups, &running,)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_set_only_edit_does_not_respawn_running_vrf() {
+        use bgp_packet::{Afi, AfiSafi, Safi};
+
+        let address: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let mut before_cfg = BgpVrfConfig::default();
+        before_cfg.neighbors.insert(address, Default::default());
+        let mut after_cfg = before_cfg.clone();
+        after_cfg
+            .neighbors
+            .get_mut(&address)
+            .unwrap()
+            .prefix_set
+            .entry(AfiSafi::new(Afi::Ip, Safi::Unicast))
+            .or_default()
+            .input = Some("CE-IN".to_string());
+        let before = BTreeMap::from([("v1".to_string(), before_cfg)]);
+        let desired = BTreeMap::from([("v1".to_string(), after_cfg)]);
+        let running = BTreeMap::from([("v1".to_string(), handle("v1"))]);
+        let groups = BTreeMap::new();
+
+        assert!(compute_vrf_respawn(&before, &groups, &desired, &groups, &running).is_empty());
+    }
+
+    #[tokio::test]
+    async fn inherited_global_spawn_input_changes_respawn_running_vrf() {
+        let cfg = BgpVrfConfig::default();
+        let before = BTreeMap::from([("v1".to_string(), cfg.clone())]);
+        let desired = before.clone();
+        let running = BTreeMap::from([(
+            "v1".to_string(),
+            handle_with_config("v1", &cfg, Ipv4Addr::UNSPECIFIED, 65000),
+        )]);
+        let groups = BTreeMap::new();
+
+        assert_eq!(
+            super::compute_vrf_respawn(
+                &before,
+                &groups,
+                &desired,
+                &groups,
+                &running,
+                "192.0.2.1".parse().unwrap(),
+                65000,
+            ),
+            vec!["v1".to_string()]
+        );
+        assert_eq!(
+            super::compute_vrf_respawn(
+                &before,
+                &groups,
+                &desired,
+                &groups,
+                &running,
+                Ipv4Addr::UNSPECIFIED,
+                65001,
+            ),
+            vec!["v1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn global_router_id_change_does_not_respawn_vrf_with_override() {
+        let cfg = BgpVrfConfig {
+            router_id: Some("198.51.100.1".parse().unwrap()),
+            ..Default::default()
+        };
+        let before = BTreeMap::from([("v1".to_string(), cfg.clone())]);
+        let desired = before.clone();
+        let running = BTreeMap::from([(
+            "v1".to_string(),
+            handle_with_config("v1", &cfg, "192.0.2.1".parse().unwrap(), 65000),
+        )]);
+        let groups = BTreeMap::new();
+
+        assert!(
+            super::compute_vrf_respawn(
+                &before,
+                &groups,
+                &desired,
+                &groups,
+                &running,
+                "192.0.2.2".parse().unwrap(),
+                65000,
+            )
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_uplane_dataplane_change_respawns_running_vrf() {
+        use super::super::super::vrf_config::MupDataplane;
+
+        let before_cfg = BgpVrfConfig::default();
+        let mut desired_cfg = before_cfg.clone();
+        desired_cfg.mobile_uplane.dataplane = MupDataplane::Gtp;
+        let before = BTreeMap::from([("v1".to_string(), before_cfg)]);
+        let desired = BTreeMap::from([("v1".to_string(), desired_cfg)]);
+        let running = BTreeMap::from([("v1".to_string(), handle("v1"))]);
+        let groups = BTreeMap::new();
+
+        assert_eq!(
+            compute_vrf_respawn(&before, &groups, &desired, &groups, &running),
+            vec!["v1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn respawn_diff_compares_effective_neighbor_afi_safis() {
+        use super::super::super::neighbor_group::{GroupAfiSafi, NeighborGroup};
+        use super::super::super::vrf_config::BgpVrfNeighborConfig;
+        use bgp_packet::{Afi, AfiSafi, Safi};
+
+        let address: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let ipv4 = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let ipv6 = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+        let mut base_cfg = BgpVrfConfig::default();
+        base_cfg.neighbors.insert(
+            address,
+            BgpVrfNeighborConfig {
+                remote_as: Some(65001),
+                ..Default::default()
+            },
+        );
+        let before = BTreeMap::from([("v1".to_string(), base_cfg.clone())]);
+        let running = BTreeMap::from([("v1".to_string(), handle("v1"))]);
+        let no_groups = BTreeMap::new();
+
+        // IPv4 is address-derived. Spelling that same effective default as
+        // an explicit activation is a representation-only change.
+        let mut explicit_default = base_cfg.clone();
+        explicit_default
+            .neighbors
+            .get_mut(&address)
+            .unwrap()
+            .mp_explicit
+            .insert(ipv4, true);
+        let explicit_default = BTreeMap::from([("v1".to_string(), explicit_default)]);
+        assert!(
+            compute_vrf_respawn(&before, &no_groups, &explicit_default, &no_groups, &running,)
+                .is_empty(),
+            "implicit and explicit IPv4 activation negotiate the same OPEN"
+        );
+
+        // Removing the address-derived family is a real capability change.
+        let mut disabled = base_cfg.clone();
+        disabled
+            .neighbors
+            .get_mut(&address)
+            .unwrap()
+            .mp_explicit
+            .insert(ipv4, false);
+        let disabled = BTreeMap::from([("v1".to_string(), disabled)]);
+        assert_eq!(
+            compute_vrf_respawn(&before, &no_groups, &disabled, &no_groups, &running),
+            vec!["v1".to_string()]
+        );
+
+        // A referenced group's opinions are resolved by materialize_peers,
+        // so changes to those opinions participate in the same effective
+        // comparison even when the neighbor row itself is unchanged.
+        let mut grouped_cfg = base_cfg;
+        grouped_cfg.neighbors.get_mut(&address).unwrap().peer_group = Some("CE".to_string());
+        let grouped = BTreeMap::from([("v1".to_string(), grouped_cfg)]);
+        let groups_before = BTreeMap::from([(
+            "CE".to_string(),
+            NeighborGroup {
+                remote_as: Some(65001),
+                ..Default::default()
+            },
+        )]);
+        let mut changed_group = groups_before["CE"].clone();
+        changed_group.afi_safi.insert(
+            ipv6,
+            GroupAfiSafi {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let groups_after = BTreeMap::from([("CE".to_string(), changed_group)]);
+        assert_eq!(
+            compute_vrf_respawn(&grouped, &groups_before, &grouped, &groups_after, &running,),
+            vec!["v1".to_string()]
+        );
+
+        let mut redundant_group = groups_before["CE"].clone();
+        redundant_group.afi_safi.insert(
+            ipv4,
+            GroupAfiSafi {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let redundant_groups = BTreeMap::from([("CE".to_string(), redundant_group)]);
+        assert!(
+            compute_vrf_respawn(
+                &grouped,
+                &groups_before,
+                &grouped,
+                &redundant_groups,
+                &running,
+            )
+            .is_empty(),
+            "a redundant group IPv4 opinion must not reset the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn respawn_diff_ignores_initial_load_and_whole_vrf_delete() {
+        let empty = BTreeMap::new();
+        let desired = BTreeMap::from([("v1".to_string(), BgpVrfConfig::default())]);
+        let no_running = BTreeMap::new();
+        let groups = BTreeMap::new();
+        assert!(compute_vrf_respawn(&empty, &groups, &desired, &groups, &no_running).is_empty());
+
+        let running = BTreeMap::from([("v1".to_string(), handle("v1"))]);
+        assert!(compute_vrf_respawn(&desired, &groups, &empty, &groups, &running).is_empty());
+        assert_eq!(compute_vrf_diff(&empty, &running).1, vec!["v1".to_string()]);
     }
 }

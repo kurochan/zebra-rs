@@ -2759,7 +2759,9 @@ impl Isis {
                     }
                 }
             }
-            crate::policy::PolicyRx::PrefixSet { .. }
+            crate::policy::PolicyRx::PrefixSetCommitStart { .. }
+            | crate::policy::PolicyRx::PrefixSetInventory { .. }
+            | crate::policy::PolicyRx::PrefixSet { .. }
             | crate::policy::PolicyRx::PolicyList { .. } => {}
         }
     }

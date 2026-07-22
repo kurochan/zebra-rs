@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use bgp_packet::{Ipv4Nlri, UpdatePacket};
+use bgp_packet::{Ipv4MpReachNextHop, Ipv4Nlri, UpdatePacket};
 use ipnet::Ipv4Net;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
@@ -100,6 +100,10 @@ pub enum EgressDeltaV4 {
     /// policy-deny, withdraw any prior advertisement. The carried `rib` is
     /// the *Loc-RIB* row (pre-egress-attr); the PET builds the egress attr.
     Advertise { prefix: Ipv4Net, rib: BgpRib },
+    /// Rebuild and send even when Adj-RIB-Out already contains the same
+    /// attributes. Used only to answer a received ROUTE-REFRESH; live policy
+    /// reconciliation continues to use `Advertise` and its deduplication.
+    Readvertise { prefix: Ipv4Net, rib: BgpRib },
     /// A DumpV4 ③ record: the shard already built the egress attr and put
     /// the bytes on the wire, so just record the row in `adj_out` (no
     /// rebuild — `rib.attr` is already post-policy). Keeps a dump-learned
@@ -112,7 +116,11 @@ pub enum EgressDeltaV4 {
     /// AddPath) after a policy or config change. Main sends this before
     /// re-fanning the Loc-RIB on soft-out, so the re-evaluation uses the new
     /// policy. `Box`ed to keep the enum small.
-    Refresh { ctx: Box<SyncCtx>, add_path: bool },
+    Refresh {
+        ctx: Box<SyncCtx>,
+        add_path: bool,
+        enhe_v6: Option<Ipv4MpReachNextHop>,
+    },
     /// A `show … advertised-routes` request at gate-on: reply with the PET's
     /// v4 Adj-RIB-Out (one `(prefix, paths)` per prefix) on the oneshot,
     /// since `adj_out` lives here, not on the peer.
@@ -149,12 +157,13 @@ impl PeerEgressTask {
     /// until then the engine is exercised only by the unit test. `ctx` will
     /// be refreshed by a `Refresh` delta on policy / connection change.
     /// Exits when `delta_tx` is dropped at teardown.
-    pub fn spawn(ctx: SyncCtx, add_path: bool) -> Self {
+    pub fn spawn(ctx: SyncCtx, add_path: bool, enhe_v6: Option<Ipv4MpReachNextHop>) -> Self {
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<EgressDeltaV4>();
         let task = Task::spawn(async move {
             let mut engine = Engine {
                 ctx,
                 add_path,
+                enhe_v6,
                 adj_out: AdjRibTable::new(),
                 attr_store: BgpAttrStore::new(),
             };
@@ -173,6 +182,7 @@ impl PeerEgressTask {
 struct Engine {
     ctx: SyncCtx,
     add_path: bool,
+    enhe_v6: Option<Ipv4MpReachNextHop>,
     adj_out: AdjRibTable<Out>,
     attr_store: BgpAttrStore,
 }
@@ -181,11 +191,17 @@ impl Engine {
     fn handle(&mut self, delta: EgressDeltaV4) {
         match delta {
             EgressDeltaV4::Advertise { prefix, rib } => self.advertise(prefix, rib),
+            EgressDeltaV4::Readvertise { prefix, rib } => self.advertise_inner(prefix, rib, true),
             EgressDeltaV4::RecordAdjOut { prefix, rib } => self.record_adj_out(prefix, rib),
             EgressDeltaV4::Withdraw { prefix, id } => self.withdraw(prefix, id),
-            EgressDeltaV4::Refresh { ctx, add_path } => {
+            EgressDeltaV4::Refresh {
+                ctx,
+                add_path,
+                enhe_v6,
+            } => {
                 self.ctx = *ctx;
                 self.add_path = add_path;
+                self.enhe_v6 = enhe_v6;
             }
             EgressDeltaV4::DumpAdjOut { reply } => {
                 let entries = self
@@ -210,7 +226,11 @@ impl Engine {
     /// it out — split-horizon (the best is from this peer) or policy-deny —
     /// it becomes a **withdraw** of any prior advertisement, exactly as the
     /// gate-off `Withdraw` outcome.
-    fn advertise(&mut self, prefix: Ipv4Net, mut rib: BgpRib) {
+    fn advertise(&mut self, prefix: Ipv4Net, rib: BgpRib) {
+        self.advertise_inner(prefix, rib, false);
+    }
+
+    fn advertise_inner(&mut self, prefix: Ipv4Net, mut rib: BgpRib, force: bool) {
         let built = super::route::route_update_ipv4(&self.ctx, &prefix, &rib, self.add_path)
             .and_then(|(nlri, attr)| {
                 super::route::route_apply_policy_out(&self.ctx, &nlri, attr, rib.weight)
@@ -218,7 +238,7 @@ impl Engine {
             });
         let Some((nlri, decision)) = built else {
             // Filtered: withdraw any prior advertisement of this path.
-            self.withdraw(prefix, rib.remote_id);
+            self.withdraw(prefix, if self.add_path { rib.local_id } else { 0 });
             return;
         };
         let arc = self.attr_store.intern(decision.attr);
@@ -228,8 +248,8 @@ impl Engine {
         // a re-advertise of the same attr records but does not re-send.
         let prev = self.adj_out.record_out(prefix, rib, self.add_path);
         let already_sent = prev.is_some_and(|p| Arc::ptr_eq(&p.attr, &arc));
-        if !already_sent {
-            super::update_group::send_ipv4_direct(&self.ctx, vec![(arc, nlri)], None);
+        if force || !already_sent {
+            super::update_group::send_ipv4_direct(&self.ctx, vec![(arc, nlri)], self.enhe_v6);
         }
     }
 
@@ -243,15 +263,18 @@ impl Engine {
         self.adj_out.add(prefix, rib);
     }
 
-    /// Drop `prefix`'s advertised path(s) from `adj_out` and, if it had
-    /// actually been advertised, send a withdraw — the per-peer twin of
-    /// `route_withdraw_ipv4`. Matches by **prefix**, not exact `id`: the
-    /// withdraw fan-out only knows the prefix (the path is gone), while
-    /// `adj_out` is keyed by the Loc-RIB `local_id`, so an id match would
-    /// miss. Non-AddPath has one entry per prefix; the wire withdraw carries
-    /// `id` (0 for non-AddPath). Per-path AddPath withdraw is a follow-on.
+    /// Drop `prefix`'s advertised path and, if it had actually been
+    /// advertised, send a withdraw — the per-peer twin of
+    /// `route_withdraw_ipv4`. `id == 0` is the non-AddPath whole-prefix
+    /// withdraw. Add-Path uses the Loc-RIB local-id both as the Adj-RIB-Out
+    /// key and the on-wire path-id, so only that row is removed.
     fn withdraw(&mut self, prefix: Ipv4Net, id: u32) {
-        if self.adj_out.0.remove(&prefix).is_some() {
+        let removed = if id == 0 {
+            self.adj_out.0.remove(&prefix).is_some()
+        } else {
+            self.adj_out.remove(prefix, id).is_some()
+        };
+        if removed {
             let mut update = UpdatePacket::with_max_packet_size(self.ctx.max_packet_size());
             update.ipv4_withdraw.push(Ipv4Nlri { id, prefix });
             self.ctx.send_update(update);
@@ -309,6 +332,7 @@ mod tests {
         let mut engine = Engine {
             ctx,
             add_path: false,
+            enhe_v6: None,
             adj_out: AdjRibTable::new(),
             attr_store: BgpAttrStore::new(),
         };
@@ -327,6 +351,57 @@ mod tests {
             rx.try_recv().is_err(),
             "a re-advertise of the same attr is deduped (no resend)"
         );
+
+        // A received ROUTE-REFRESH is different from policy replay: the
+        // remote explicitly asks for the current route again.
+        engine.handle(EgressDeltaV4::Readvertise {
+            prefix,
+            rib: rib(5, "192.0.2.1"),
+        });
+        assert!(
+            rx.try_recv().is_ok(),
+            "ROUTE-REFRESH must resend an unchanged route"
+        );
+    }
+
+    /// A policy replay / ROUTE-REFRESH runs after `Refresh`; it must retain
+    /// RFC 8950 ENHE instead of silently falling back to legacy NEXT_HOP.
+    #[test]
+    fn engine_refresh_replay_uses_composed_enhe_next_hop() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut ctx = SyncCtx::for_test();
+        ctx.packet_tx = Some(tx);
+        let mut engine = Engine {
+            ctx: ctx.clone(),
+            add_path: false,
+            enhe_v6: None,
+            adj_out: AdjRibTable::new(),
+            attr_store: BgpAttrStore::new(),
+        };
+        let prefix: Ipv4Net = "10.10.20.0/24".parse().unwrap();
+        let route = rib(5, "192.0.2.1");
+        let nh = Ipv4MpReachNextHop::LinkLocal("fe80::20".parse().unwrap());
+
+        engine.handle(EgressDeltaV4::Refresh {
+            ctx: Box::new(ctx),
+            add_path: false,
+            enhe_v6: Some(nh),
+        });
+        engine.handle(EgressDeltaV4::Readvertise { prefix, rib: route });
+
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let advertised = &engine.adj_out.0[&prefix][0];
+        let golden = super::super::update_group::encode_ipv4_update(
+            &advertised.attr,
+            &[Ipv4Nlri { id: 0, prefix }],
+            engine.ctx.max_packet_size(),
+            engine.ctx.as4,
+            Some(nh),
+        );
+        assert_eq!(
+            sent, golden,
+            "replay must encode IPv4 NLRI in ENHE MP_REACH"
+        );
     }
 
     #[test]
@@ -337,6 +412,7 @@ mod tests {
         let mut engine = Engine {
             ctx,
             add_path: false,
+            enhe_v6: None,
             adj_out: AdjRibTable::new(),
             attr_store: BgpAttrStore::new(),
         };
@@ -364,6 +440,7 @@ mod tests {
         let mut engine = Engine {
             ctx,
             add_path: false,
+            enhe_v6: None,
             adj_out: AdjRibTable::new(),
             attr_store: BgpAttrStore::new(),
         };
@@ -394,6 +471,7 @@ mod tests {
         let mut engine = Engine {
             ctx,
             add_path: false,
+            enhe_v6: None,
             adj_out: AdjRibTable::new(),
             attr_store: BgpAttrStore::new(),
         };
@@ -421,6 +499,38 @@ mod tests {
     }
 
     #[test]
+    fn engine_addpath_policy_filter_withdraws_only_local_path_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut ctx = SyncCtx::for_test();
+        ctx.packet_tx = Some(tx);
+        let mut engine = Engine {
+            ctx,
+            add_path: true,
+            enhe_v6: None,
+            adj_out: AdjRibTable::new(),
+            attr_store: BgpAttrStore::new(),
+        };
+        let prefix: Ipv4Net = "10.10.10.0/24".parse().unwrap();
+        let mut path1 = rib(5, "192.0.2.1");
+        path1.local_id = 11;
+        let mut path2 = rib(6, "192.0.2.2");
+        path2.local_id = 12;
+        engine.advertise(prefix, path1.clone());
+        engine.advertise(prefix, path2);
+        let _ = std::iter::from_fn(|| rx.try_recv().ok()).count();
+
+        // Make path 1 fail split horizon. Its remote-id remains zero; the
+        // withdraw must nevertheless use its advertised local path-id 11.
+        path1.ident = engine.ctx.ident;
+        engine.advertise(prefix, path1);
+
+        let packet = rx.try_recv().expect("filtered Add-Path row is withdrawn");
+        assert_eq!(engine.adj_out.0[&prefix].len(), 1);
+        assert_eq!(engine.adj_out.0[&prefix][0].local_id, 12);
+        assert!(packet.windows(4).any(|bytes| bytes == 11_u32.to_be_bytes()));
+    }
+
+    #[test]
     fn engine_refresh_swaps_the_ctx() {
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let mut ctx1 = SyncCtx::for_test();
@@ -428,6 +538,7 @@ mod tests {
         let mut engine = Engine {
             ctx: ctx1,
             add_path: false,
+            enhe_v6: None,
             adj_out: AdjRibTable::new(),
             attr_store: BgpAttrStore::new(),
         };
@@ -439,6 +550,7 @@ mod tests {
         engine.handle(EgressDeltaV4::Refresh {
             ctx: Box::new(ctx2),
             add_path: false,
+            enhe_v6: None,
         });
 
         // Subsequent egress uses the refreshed snapshot's writer.
@@ -459,6 +571,7 @@ mod tests {
         let mut engine = Engine {
             ctx,
             add_path: false,
+            enhe_v6: None,
             adj_out: AdjRibTable::new(),
             attr_store: BgpAttrStore::new(),
         };
@@ -477,7 +590,7 @@ mod tests {
     async fn pet_lifecycle_spawn_send_teardown() {
         // The task spawns, accepts a delta on the live channel, and exits on
         // drop (abort-on-drop / channel close) without panicking.
-        let pet = PeerEgressTask::spawn(SyncCtx::for_test(), false);
+        let pet = PeerEgressTask::spawn(SyncCtx::for_test(), false, None);
         pet.delta_tx
             .send(EgressDeltaV4::Withdraw {
                 prefix: "10.0.0.0/24".parse().unwrap(),

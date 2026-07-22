@@ -1,0 +1,22 @@
+interface:
+- if-name: iso-router
+  ipv4:
+    address: 192.0.2.14/30
+router:
+  bgp:
+    global:
+      as: 65101
+      router-id: 192.0.2.14
+    neighbor:
+    - remote-address: 192.0.2.13
+      remote-as: 65001
+      timers: {connect-retry-time: 3}
+      enabled: true
+      afi-safi:
+      - name: ipv4
+        enabled: true
+    afi-safi:
+    - name: ipv4
+      network:
+      - prefix: 10.20.0.0/24
+      - prefix: 10.20.99.0/24

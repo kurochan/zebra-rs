@@ -6437,7 +6437,9 @@ impl Ospf<Ospfv2> {
                 self.as_external_redist_resync_all();
                 self.as_external_table_resync_all();
             }
-            crate::policy::PolicyRx::PrefixSet { .. } => {
+            crate::policy::PolicyRx::PrefixSetCommitStart { .. }
+            | crate::policy::PolicyRx::PrefixSetInventory { .. }
+            | crate::policy::PolicyRx::PrefixSet { .. } => {
                 // OSPF doesn't subscribe to bare prefix-sets (the
                 // policy actor resolves them into pushed lists).
             }
@@ -11724,7 +11726,9 @@ impl Ospf<Ospfv3> {
                 }
                 self.as_external_redist_resync_all_v3();
             }
-            crate::policy::PolicyRx::PrefixSet { .. } => {}
+            crate::policy::PolicyRx::PrefixSetCommitStart { .. }
+            | crate::policy::PolicyRx::PrefixSetInventory { .. }
+            | crate::policy::PolicyRx::PrefixSet { .. } => {}
         }
     }
 }

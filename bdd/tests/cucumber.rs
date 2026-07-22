@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,15 @@ use serde_json::Value;
 pub struct World {
     topology_running: bool,
     feature_tag: String,
+    bgp_checkpoints: HashMap<String, BgpCheckpoint>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BgpCheckpoint {
+    open_sent: u64,
+    open_rcvd: u64,
+    update_sent: u64,
+    update_rcvd: u64,
 }
 
 impl World {
@@ -928,6 +937,70 @@ async fn verify_bgp_session(
     );
 }
 
+async fn bgp_checkpoint(world: &World, namespace: &str, neighbor: &str) -> BgpCheckpoint {
+    let scoped = world.ns(namespace);
+    let cmd = format!("show bgp neighbor {}", neighbor);
+    let output = netns::exec_in_netns(&scoped, "vtyctl", &["show", "-j", &cmd])
+        .await
+        .expect("Failed to get BGP neighbor counters");
+    let json: Value = serde_json::from_str(&output).expect("Failed to parse BGP neighbor JSON");
+    let counter = |kind: &str, direction: &str| {
+        json.pointer(&format!("/count/{kind}/{direction}"))
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("missing count.{kind}.{direction} in {output}"))
+    };
+    BgpCheckpoint {
+        open_sent: counter("open", "sent"),
+        open_rcvd: counter("open", "rcvd"),
+        update_sent: counter("update", "sent"),
+        update_rcvd: counter("update", "rcvd"),
+    }
+}
+
+fn bgp_checkpoint_key(namespace: &str, neighbor: &str) -> String {
+    format!("{namespace}|{neighbor}")
+}
+
+#[when(expr = "I remember BGP counters in {string} to {string}")]
+async fn remember_bgp_counters(world: &mut World, namespace: String, neighbor: String) {
+    let checkpoint = bgp_checkpoint(world, &namespace, &neighbor).await;
+    world
+        .bgp_checkpoints
+        .insert(bgp_checkpoint_key(&namespace, &neighbor), checkpoint);
+}
+
+#[then(expr = "BGP session in {string} to {string} should not have reset since remembered")]
+async fn verify_bgp_session_not_reset(world: &mut World, namespace: String, neighbor: String) {
+    let before = *world
+        .bgp_checkpoints
+        .get(&bgp_checkpoint_key(&namespace, &neighbor))
+        .expect("BGP counters were not remembered");
+    let after = bgp_checkpoint(world, &namespace, &neighbor).await;
+    assert_eq!(
+        (after.open_sent, after.open_rcvd),
+        (before.open_sent, before.open_rcvd),
+        "BGP OPEN counters changed for {} -> {}; the session reset",
+        world.ns(&namespace),
+        neighbor,
+    );
+}
+
+#[then(expr = "BGP UPDATE count in {string} to {string} should be unchanged since remembered")]
+async fn verify_bgp_update_count_unchanged(world: &mut World, namespace: String, neighbor: String) {
+    let before = *world
+        .bgp_checkpoints
+        .get(&bgp_checkpoint_key(&namespace, &neighbor))
+        .expect("BGP counters were not remembered");
+    let after = bgp_checkpoint(world, &namespace, &neighbor).await;
+    assert_eq!(
+        (after.update_sent, after.update_rcvd),
+        (before.update_sent, before.update_rcvd),
+        "BGP UPDATE counters changed for {} -> {}",
+        world.ns(&namespace),
+        neighbor,
+    );
+}
+
 #[then(expr = "BGP session in {string} to {string} should not be {string}")]
 async fn verify_bgp_session_not(
     world: &mut World,
@@ -1363,6 +1436,18 @@ async fn test_topology_exists(world: &mut World) {
         && netns::netns_exists(&z2).await.unwrap_or(false);
 }
 
+#[given("the per-VRF prefix-set topology exists")]
+async fn bgp_vrf_prefix_set_topology_exists(world: &mut World) {
+    for logical in ["peer-a", "router", "peer-b"] {
+        let scoped = world.ns(logical);
+        assert!(
+            netns::netns_exists(&scoped).await.unwrap_or(false),
+            "required namespace {scoped} does not exist"
+        );
+    }
+    world.topology_running = true;
+}
+
 /// Run a `vtyctl show <command>` inside a namespace and assert the
 /// stdout contains the given substring. Used by the IS-IS multi-
 /// topology feature to verify MT TLVs land in `show isis database
@@ -1390,6 +1475,93 @@ async fn show_command_contains(
     println!(
         "✓ show '{}' in namespace {} contains '{}'",
         show_cmd, scoped, needle
+    );
+}
+
+/// JSON sibling of `show command ... should contain ...`. This exercises
+/// the actual `vtyctl show -j` path instead of only the serializer unit tests.
+#[then(expr = "show JSON command {string} in namespace {string} should contain {string}")]
+async fn show_json_command_contains(
+    world: &mut World,
+    show_cmd: String,
+    namespace: String,
+    needle: String,
+) {
+    let scoped = world.ns(&namespace);
+    let output = netns::exec_in_netns(&scoped, "vtyctl", &["show", "-j", &show_cmd])
+        .await
+        .expect("Failed to run JSON show command");
+    // Parse first so a text fallback cannot accidentally satisfy the
+    // substring assertion.
+    serde_json::from_str::<Value>(&output).expect("JSON show output was not valid JSON");
+    assert!(
+        output.contains(&needle),
+        "JSON show '{}' in namespace {} did not contain '{}'\nfull output:\n{}",
+        show_cmd,
+        scoped,
+        needle,
+        output,
+    );
+    println!(
+        "✓ JSON show '{}' in namespace {} contains '{}'",
+        show_cmd, scoped, needle
+    );
+}
+
+/// Assert an AFI policy-binding row structurally.  This deliberately avoids
+/// substring checks, which can match the other family or a similarly named
+/// prefix-set and cannot distinguish JSON `false` from text around it.
+#[then(
+    expr = "show JSON policy binding for scope {string} from command {string} in namespace {string} should have in {string} resolved {word} and out {string} resolved {word}"
+)]
+async fn show_json_policy_binding_exact(
+    world: &mut World,
+    scope: String,
+    show_cmd: String,
+    namespace: String,
+    prefix_set_in: String,
+    prefix_set_in_resolved: String,
+    prefix_set_out: String,
+    prefix_set_out_resolved: String,
+) {
+    let scoped = world.ns(&namespace);
+    let output = netns::exec_in_netns(&scoped, "vtyctl", &["show", "-j", &show_cmd])
+        .await
+        .expect("Failed to run JSON show command");
+    let json: Value = serde_json::from_str(&output).expect("JSON show output was not valid JSON");
+    let bindings = json
+        .get("policy_bindings")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing policy_bindings array in {output}"));
+    let binding = bindings
+        .iter()
+        .find(|binding| binding.get("scope").and_then(Value::as_str) == Some(scope.as_str()))
+        .unwrap_or_else(|| panic!("missing policy binding scope {scope} in {output}"));
+    let parse_bool = |value: &str| match value {
+        "true" => true,
+        "false" => false,
+        _ => panic!("resolved value must be true or false, got {value}"),
+    };
+
+    assert_eq!(
+        binding.get("prefix_set_in").and_then(Value::as_str),
+        Some(prefix_set_in.as_str())
+    );
+    assert_eq!(
+        binding
+            .get("prefix_set_in_resolved")
+            .and_then(Value::as_bool),
+        Some(parse_bool(&prefix_set_in_resolved))
+    );
+    assert_eq!(
+        binding.get("prefix_set_out").and_then(Value::as_str),
+        Some(prefix_set_out.as_str())
+    );
+    assert_eq!(
+        binding
+            .get("prefix_set_out_resolved")
+            .and_then(Value::as_bool),
+        Some(parse_bool(&prefix_set_out_resolved))
     );
 }
 

@@ -1,0 +1,21 @@
+interface:
+- if-name: router
+  ipv4:
+    address: 192.0.2.6/30
+  ipv6:
+    address: 2001:db8:23::2/64
+router:
+  bgp:
+    global:
+      as: 65003
+      router-id: 192.0.2.6
+    neighbor:
+    - remote-address: 192.0.2.5
+      remote-as: 65001
+      timers: {connect-retry-time: 3}
+      enabled: true
+      afi-safi:
+      - name: ipv4
+        enabled: true
+      - name: ipv6
+        enabled: true
