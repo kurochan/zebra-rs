@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 
-use bgp_packet::{AfiSafi, RouteDistinguisher};
+use bgp_packet::{Afi, AfiSafi, RouteDistinguisher, Safi};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::bgp_vrf_trace;
@@ -88,7 +88,7 @@ impl BgpVrfEncapsulation {
 /// Per-peer attribute set for a CE peer configured under
 /// `router bgp vrf X neighbor <addr>`. Mirrors `bgp-vrf-neighbor` in
 /// zebra-bgp-vrf.yang.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BgpVrfNeighborConfig {
     pub remote_as: Option<u32>,
     pub peer_group: Option<String>,
@@ -291,6 +291,77 @@ pub struct BgpVrfConfig {
     /// Per-VRF BGP MUP (draft-ietf-bess-mup-safi) service config. Mirrors the
     /// `mup` container in zebra-bgp-vrf.yang.
     pub mobile_uplane: BgpVrfMobileUplane,
+}
+
+/// Whether two candidate configs materialize the same long-lived VRF task.
+/// Network/redistribution and MUP route changes have dedicated runtime
+/// messages/reconciliation and must not reset CE sessions.
+pub(crate) fn runtime_structure_eq(
+    before: &BgpVrfConfig,
+    before_groups: &BTreeMap<String, super::neighbor_group::NeighborGroup>,
+    after: &BgpVrfConfig,
+    after_groups: &BTreeMap<String, super::neighbor_group::NeighborGroup>,
+) -> bool {
+    let neighbor_structure =
+        |cfg: &BgpVrfConfig, groups: &BTreeMap<String, super::neighbor_group::NeighborGroup>| {
+            cfg.neighbors
+                .iter()
+                .map(|(address, neighbor)| {
+                    let mut neighbor = neighbor.clone();
+
+                    // Compare what materialize_peers actually puts on the wire,
+                    // not the spelling of the activation intent. For an IPv4
+                    // neighbor, absent activation and explicit `ipv4 enabled
+                    // true` both negotiate the same singleton MP set and must
+                    // not reset an established session. Group opinions are part
+                    // of the same resolution stack and therefore use their own
+                    // transaction snapshots here.
+                    let group = neighbor
+                        .peer_group
+                        .as_ref()
+                        .and_then(|name| groups.get(name));
+                    neighbor.remote_as = neighbor
+                        .remote_as
+                        .or_else(|| group.and_then(|group| group.remote_as));
+                    let base = if address.is_ipv6() {
+                        AfiSafi::new(Afi::Ip6, Safi::Unicast)
+                    } else {
+                        AfiSafi::new(Afi::Ip, Safi::Unicast)
+                    };
+                    let mut effective = BTreeMap::from([(base, true)]);
+                    if let Some(group) = group {
+                        for (family, opinion) in &group.afi_safi {
+                            if opinion.enabled {
+                                effective.insert(*family, true);
+                            } else {
+                                effective.remove(family);
+                            }
+                        }
+                    }
+                    for (family, enabled) in &neighbor.mp_explicit {
+                        if *enabled {
+                            effective.insert(*family, true);
+                        } else {
+                            effective.remove(family);
+                        }
+                    }
+                    neighbor.mp_explicit = effective;
+                    (*address, neighbor)
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+
+    before.rd == after.rd
+        && before.router_id == after.router_id
+        && before.label_mode == after.label_mode
+        && before.encapsulation == after.encapsulation
+        && neighbor_structure(before, before_groups) == neighbor_structure(after, after_groups)
+        && before.evpn_advertise_v4 == after.evpn_advertise_v4
+        && before.evpn_advertise_v6 == after.evpn_advertise_v6
+        && before.l3vni == after.l3vni
+        && before.router_mac == after.router_mac
+        && before.inter_as_hybrid == after.inter_as_hybrid
+        && before.mobile_uplane.dataplane == after.mobile_uplane.dataplane
 }
 
 /// Borrow the per-VRF entry on `Bgp::vrfs`, creating it for Set (the

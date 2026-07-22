@@ -17,7 +17,7 @@
 //! [`crate::rib::client::ClientRegistry`].
 
 use std::collections::BTreeMap;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -38,6 +38,11 @@ use crate::config::RibSubscriber;
 /// [`Task`] so dropping the handle aborts the runtime cleanly.
 pub struct BgpVrfHandle {
     pub inbox: BgpVrfInbox,
+    /// Effective router ID captured by the running VRF task at spawn time.
+    /// Used to detect changes to the inherited global router ID.
+    pub router_id: Ipv4Addr,
+    /// Global ASN captured by the running VRF task at spawn time.
+    pub asn: u32,
     /// Clone of the per-VRF task's show channel sender. Registered with
     /// the config manager (`SubscribeShowVrf`) so `show bgp vrf <name>
     /// …` is redirected into this task; deregistered on despawn.
@@ -85,9 +90,8 @@ pub struct BgpVrfHandle {
 /// Pure diff: which VRF names need to be spawned (in `desired`
 /// but not `running`) and which need to be despawned (in
 /// `running` but not `desired`). Names that appear in both are
-/// considered unchanged — the diff does not yet detect edits to
-/// `rd` / `router-id` / `label-mode`; a follow-up will layer edit
-/// detection on top by hashing the cfg.
+/// considered unchanged here; [`compute_vrf_respawn`] separately detects
+/// spawn-time structural edits within the same transaction.
 pub fn compute_vrf_diff(
     desired: &BTreeMap<String, BgpVrfConfig>,
     running: &BTreeMap<String, BgpVrfHandle>,
@@ -103,6 +107,37 @@ pub fn compute_vrf_diff(
         .cloned()
         .collect();
     (to_spawn, to_despawn)
+}
+
+/// Existing VRF tasks whose spawn-time structure changed during this config
+/// transaction. Additions and removals are handled by [`compute_vrf_diff`];
+/// only names present before, after, and in the running registry can respawn.
+pub fn compute_vrf_respawn(
+    before: &BTreeMap<String, BgpVrfConfig>,
+    before_groups: &BTreeMap<String, NeighborGroup>,
+    desired: &BTreeMap<String, BgpVrfConfig>,
+    desired_groups: &BTreeMap<String, NeighborGroup>,
+    running: &BTreeMap<String, BgpVrfHandle>,
+    router_id: Ipv4Addr,
+    asn: u32,
+) -> Vec<String> {
+    desired
+        .iter()
+        .filter(|(name, after)| {
+            running.get(*name).is_some_and(|handle| {
+                before.get(*name).is_some_and(|before| {
+                    !super::super::vrf_config::runtime_structure_eq(
+                        before,
+                        before_groups,
+                        after,
+                        desired_groups,
+                    ) || handle.router_id != after.router_id.unwrap_or(router_id)
+                        || handle.asn != asn
+                })
+            })
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Build + spawn a per-VRF task. Returns the handle the caller
@@ -169,9 +204,9 @@ pub fn spawn_bgp_vrf(
             (ProtoContext::default_table_no_rib(), rib_rx)
         }
     };
-    // Per-VRF override on router-id wins over the global one. An
-    // operator edit to router-id post-spawn doesn't bubble through
-    // yet — a follow-up adds the respawn-on-edit detection.
+    // Per-VRF override on router-id wins over the global one. The handle
+    // retains this effective value so commit diffing can respawn a task when
+    // its inherited global router ID changes.
     let effective_router_id = cfg.router_id.unwrap_or(router_id);
     let (mut vrf, inbox) = BgpVrf::new(
         name.clone(),
@@ -188,7 +223,7 @@ pub fn spawn_bgp_vrf(
     // The VRF's RD scopes its per-VRF MUP RIB to its own RD (imported MUP
     // routes are re-keyed under it, not their origin RD). Captured at spawn
     // like router-id; an `rd` edit on a live VRF doesn't re-key the running
-    // task yet (a follow-up adds respawn-on-edit, same as router-id).
+    // task directly; the structural commit diff respawns it on an RD edit.
     vrf.rd = cfg.rd;
     // The MUP forwarding-plane mode (End.DT46 stand-in vs cradle GTP-U).
     // Spawn-time capture like `rd`; a live `dataplane` edit respawns the VRF.
@@ -317,6 +352,8 @@ pub fn spawn_bgp_vrf(
     }
     BgpVrfHandle {
         inbox,
+        router_id: effective_router_id,
+        asn,
         show_tx,
         task,
         label,
